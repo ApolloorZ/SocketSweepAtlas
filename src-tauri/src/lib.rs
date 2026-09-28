@@ -11,6 +11,8 @@
 //   → "SHUTDOWN\n"          ← {"status":"ok","message":"shutting down"}
 // ============================================================================
 
+mod pairing;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
@@ -35,7 +37,7 @@ static DEVICE_SERIAL: Mutex<Option<String>> = Mutex::new(None);
 
 use tauri::Manager;
 
-fn get_bundled_binary(app: &tauri::AppHandle, name: &str) -> Result<std::path::PathBuf, String> {
+pub(crate) fn get_bundled_binary(app: &tauri::AppHandle, name: &str) -> Result<std::path::PathBuf, String> {
     let resource_dir = app.path().resource_dir().map_err(|e| format!("Failed to get resource dir: {}", e))?;
 
     // On Windows, host-native binaries like ADB use a .exe extension.
@@ -61,7 +63,7 @@ fn get_bundled_binary(app: &tauri::AppHandle, name: &str) -> Result<std::path::P
 
 /// Run an ADB command and return its stdout. Maps any failure to a
 /// human-readable `Err(String)`.
-fn adb(adb_path: &std::path::Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn adb(adb_path: &std::path::Path, args: &[&str]) -> Result<String, String> {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
@@ -185,33 +187,60 @@ fn check_adb(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command(async)]
-fn init_daemon(app: tauri::AppHandle) -> Result<String, String> {
+fn init_daemon(app: tauri::AppHandle, serial: Option<String>) -> Result<String, String> {
     let adb_path = get_bundled_binary(&app, "adb")?;
     let daemon_src = get_bundled_binary(&app, "daemon")?;
 
     // 1 — Verify ADB is reachable and a device is connected.
     adb(&adb_path, &["version"])?;
     let devices = adb(&adb_path, &["devices"])?;
-    let device_line = devices
+    let available: Vec<(String, String)> = devices
         .lines()
-        .find(|l| l.ends_with("\tdevice") && !l.starts_with("List"));
+        .skip(1)
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let serial = cols.next()?.to_string();
+            let status = cols.next()?.to_string();
+            Some((serial, status))
+        })
+        .collect();
 
-    let serial = match device_line {
-        Some(line) => line.split('\t').next().unwrap_or("").trim().to_string(),
-        None => {
-            // Check for unauthorized devices to give a better error.
-            if devices.lines().any(|l| l.contains("unauthorized")) {
-                return Err("USB Debugging not authorised. Check the confirmation dialog on your phone.".into());
+    let serial = match serial.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(requested) => match available.iter().find(|(s, _)| s == &requested) {
+            Some((_, status)) if status == "device" => requested,
+            Some((_, status)) => {
+                return Err(format!("设备 {requested} 当前状态是「{status}」,还不能用。"))
             }
-            return Err(
-                "No Android device detected. Connect your phone via USB and enable USB Debugging.".into(),
-            );
-        }
+            None => {
+                // A wireless phone re-registers under a new name whenever its IP or
+                // debug port changes, so a pinned serial goes stale on its own. With
+                // a single usable device there is nothing to guess wrong.
+                let mut usable = available
+                    .iter()
+                    .filter(|(_, status)| status == "device")
+                    .map(|(serial, _)| serial.clone());
+                match (usable.next(), usable.next()) {
+                    (Some(only), None) => only,
+                    _ => return Err(format!("没有找到设备 {requested},请重新连接一次。")),
+                }
+            }
+        },
+        None => match available.iter().find(|(_, status)| status == "device") {
+            Some((serial, _)) => serial.clone(),
+            None => {
+                if available.iter().any(|(_, status)| status == "unauthorized") {
+                    return Err("USB Debugging not authorised. Check the confirmation dialog on your phone.".into());
+                }
+                return Err(
+                    "No Android device detected. Connect your phone via USB and enable USB Debugging.".into(),
+                );
+            }
+        },
     };
 
     // Store the serial so all subsequent ADB calls (including stop_daemon) target this device.
     if let Ok(mut guard) = DEVICE_SERIAL.lock() {
-        *guard = Some(serial);
+        *guard = Some(serial.clone());
     }
 
     // 2 — Kill any zombie daemon before we push/start.
@@ -258,7 +287,7 @@ fn init_daemon(app: tauri::AppHandle) -> Result<String, String> {
     }
 
     Ok(format!(
-        "{{\"daemon_pid\":\"{pid}\",\"ping_response\":{pong}}}"
+        "{{\"daemon_pid\":\"{pid}\",\"serial\":\"{serial}\",\"ping_response\":{pong}}}"
     ))
 }
 
@@ -293,6 +322,42 @@ fn stop_daemon(app: tauri::AppHandle) -> Result<String, String> {
     Ok(response)
 }
 
+#[tauri::command(async)]
+fn get_storage_info(app: tauri::AppHandle) -> Result<String, String> {
+    let adb_path = get_bundled_binary(&app, "adb")?;
+    let output = adb_s(&adb_path, &["shell", "df -k /sdcard"])?;
+
+    // `df -k` prints a header then one row per mount; prefer the row we asked about.
+    let header_kb = output.lines().next().map(|l| l.contains("1K-blocks")).unwrap_or(false);
+    let row = output
+        .lines()
+        .skip(1)
+        .find(|l| l.contains("/storage") || l.contains("/sdcard"))
+        .or_else(|| output.lines().nth(1))
+        .ok_or("Failed to read device storage capacity: empty df output")?;
+
+    let cols: Vec<&str> = row.split_whitespace().collect();
+    if cols.len() < 4 {
+        return Err(format!("Failed to read device storage capacity: unparsable df row '{row}'"));
+    }
+    if !header_kb {
+        return Err(format!("Failed to read device storage capacity: df did not report 1K blocks ({row})"));
+    }
+
+    let parse_kb = |v: &str| -> Result<i64, String> {
+        v.parse::<i64>()
+            .map(|kb| kb * 1024)
+            .map_err(|e| format!("Failed to read device storage capacity: bad value '{v}' ({e})"))
+    };
+
+    Ok(format!(
+        "{{\"total_bytes\":{},\"used_bytes\":{},\"free_bytes\":{}}}",
+        parse_kb(cols[1])?,
+        parse_kb(cols[2])?,
+        parse_kb(cols[3])?,
+    ))
+}
+
 #[tauri::command]
 fn delete_item(path: String) -> Result<String, String> {
     // Prevent deletion of the scan root directory.
@@ -306,6 +371,230 @@ fn delete_item(path: String) -> Result<String, String> {
     daemon_command(&format!("DELETE {path}"))
 }
 
+// ── Device management (USB + wireless adb) ──────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct DeviceInfo {
+    serial: String,
+    model: String,
+    kind: String,
+    status: String,
+}
+
+#[tauri::command(async)]
+fn list_devices(app: tauri::AppHandle) -> Result<String, String> {
+    let adb_path = get_bundled_binary(&app, "adb")?;
+    let output = adb(&adb_path, &["devices", "-l"])?;
+
+    let mut devices = Vec::new();
+    // `adb devices -l` pads columns with spaces, so split on whitespace rather
+    // than relying on the tab that plain `adb devices` uses.
+    for line in output.lines().skip(1) {
+        let line = line.trim();
+        let mut cols = line.split_whitespace();
+        let (Some(serial), Some(status)) = (cols.next(), cols.next()) else { continue };
+        if serial == "List" || serial.starts_with('*') {
+            continue;
+        }
+        let model = cols
+            .find(|c| c.starts_with("model:"))
+            .map(|c| c["model:".len()..].replace('_', " "))
+            .unwrap_or_default();
+
+        // Wireless devices appear either as ip:port or under the name adb gives an
+        // mDNS-discovered transport, e.g. adb-982b7b0a-xxxx._adb-tls-connect._tcp
+        let wireless = pairing::is_wireless_serial(serial);
+
+        devices.push(DeviceInfo {
+            serial: serial.to_string(),
+            model,
+            kind: if wireless { "wireless".into() } else { "usb".into() },
+            status: status.to_string(),
+        });
+    }
+
+    serde_json::to_string(&devices).map_err(|e| format!("Failed to describe devices: {e}"))
+}
+
+#[tauri::command(async)]
+fn pair_device(app: tauri::AppHandle, target: String, code: String) -> Result<String, String> {
+    let adb_path = get_bundled_binary(&app, "adb")?;
+    let code = code.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+    if code.len() != 6 {
+        return Err("配对码是手机上显示的那 6 位数字。".into());
+    }
+    if !target.contains(':') {
+        return Err("请填写“IP:端口”,用无线调试配对界面上显示的那个地址。".into());
+    }
+    adb(&adb_path, &["pair", target.trim(), &code])
+}
+
+#[tauri::command(async)]
+fn connect_device(app: tauri::AppHandle, target: String) -> Result<String, String> {
+    let adb_path = get_bundled_binary(&app, "adb")?;
+    let target = target.trim().to_string();
+    if target.is_empty() {
+        return Err("请填写手机“无线调试”页面上显示的 IP:端口。".into());
+    }
+    adb(&adb_path, &["connect", &target])
+}
+
+#[tauri::command(async)]
+fn disconnect_device(app: tauri::AppHandle, target: String) -> Result<String, String> {
+    let adb_path = get_bundled_binary(&app, "adb")?;
+    adb(&adb_path, &["disconnect", target.trim()])
+}
+
+// ── Local cache & opening device files on the PC ────────────────────────────
+// The daemon only reports metadata, so viewing a file on the PC means pulling
+// its contents first. Pulled files live in a cache we can reopen instantly.
+
+use tauri::Emitter;
+
+fn cache_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = match std::env::var("SOCKETSWEEP_CACHE_DIR") {
+        Ok(custom) if !custom.is_empty() => std::path::PathBuf::from(custom),
+        _ => app
+            .path()
+            .app_cache_dir()
+            .map_err(|e| format!("Failed to locate a cache folder: {e}"))?
+            .join("socketsweep"),
+    };
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create the cache folder {:?}: {e}", dir))?;
+    Ok(dir)
+}
+
+/// Flattens a device path into a single safe file name, e.g.
+/// `/sdcard/DCIM/a.jpg` → `sdcard_DCIM_a.jpg`.
+fn cached_file_name(device_path: &str) -> String {
+    device_path
+        .trim_start_matches('/')
+        .replace('/', "_")
+        .chars()
+        .map(|c| match c {
+            ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            other => other,
+        })
+        .collect()
+}
+
+#[tauri::command(async)]
+fn cached_files(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let dir = cache_dir(&app)?;
+    let mut names = Vec::new();
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("Failed to read the cache folder: {e}"))?;
+    for entry in entries.flatten() {
+        if entry.path().is_file() {
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// Pulls `device_path` into the cache, reporting progress as it goes, and
+/// optionally hands it to the OS default application. Returns the local path.
+#[tauri::command(async)]
+fn pull_file(
+    app: tauri::AppHandle,
+    device_path: String,
+    size: i64,
+    open: bool,
+) -> Result<String, String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let adb_path = get_bundled_binary(&app, "adb")?;
+    let local = cache_dir(&app)?.join(cached_file_name(&device_path));
+    let local_str = local
+        .to_str()
+        .ok_or_else(|| format!("Cache path is not valid text: {:?}", local))?
+        .to_string();
+
+    let already_cached = size > 0
+        && local.is_file()
+        && local.metadata().map(|m| m.len() as i64).unwrap_or(0) == size;
+
+    if !already_cached {
+        let _ = std::fs::remove_file(&local);
+        let mut child = Command::new(&adb_path)
+            .args(["pull", &device_path, &local_str])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to start adb pull: {e}"))?;
+
+        while let Ok(None) = child.try_wait() {
+            let done = std::fs::metadata(&local).map(|m| m.len() as i64).unwrap_or(0);
+            let _ = app.emit(
+                "pull-progress",
+                serde_json::json!({ "path": device_path, "done": done, "total": size }),
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        let status = child
+            .wait()
+            .map_err(|e| format!("adb pull could not finish: {e}"))?;
+        if !status.success() {
+            let _ = std::fs::remove_file(&local);
+            return Err(format!("adb pull failed for {device_path}"));
+        }
+    }
+
+    let _ = app.emit(
+        "pull-progress",
+        serde_json::json!({ "path": device_path, "done": size, "total": size }),
+    );
+
+    if open {
+        app.opener()
+            .open_path(&local_str, None::<&str>)
+            .map_err(|e| format!("文件已拉到电脑,但打不开:{}", e))?;
+    }
+
+    Ok(local_str)
+}
+
+#[tauri::command(async)]
+fn reveal_cached_folder(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = cache_dir(&app)?;
+    let path = dir
+        .to_str()
+        .ok_or_else(|| format!("Cache path is not valid text: {:?}", dir))?
+        .to_string();
+    app.opener()
+        .open_path(&path, None::<&str>)
+        .map_err(|e| format!("Could not open the cache folder: {e}"))?;
+    Ok(path)
+}
+
+#[tauri::command(async)]
+fn start_qr_pairing(app: tauri::AppHandle) -> Result<String, String> {
+    let (svg, text) = pairing::start(app)?;
+    Ok(format!(
+        "{{\"svg\":{},\"text\":{}}}",
+        serde_json::to_string(&svg).unwrap_or_default(),
+        serde_json::to_string(&text).unwrap_or_default()
+    ))
+}
+
+#[tauri::command(async)]
+fn cancel_qr_pairing() -> Result<String, String> {
+    pairing::cancel();
+    Ok("{\"status\":\"cancelled\"}".into())
+}
+
+/// The wireless button's first move: connect without the user touching anything.
+#[tauri::command(async)]
+fn wireless_auto_connect(app: tauri::AppHandle) -> Result<String, String> {
+    let adb_path = get_bundled_binary(&app, "adb")?;
+    let result = pairing::auto_connect(&adb_path)?;
+    serde_json::to_string(&result).map_err(|e| format!("Failed to report devices: {e}"))
+}
+
 // ── Tauri entry point ───────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -316,9 +605,20 @@ pub fn run() {
             check_adb,
             init_daemon,
             run_scan,
+            get_storage_info,
             ping_daemon,
             stop_daemon,
             delete_item,
+            list_devices,
+            pair_device,
+            connect_device,
+            disconnect_device,
+            start_qr_pairing,
+            cancel_qr_pairing,
+            wireless_auto_connect,
+            cached_files,
+            pull_file,
+            reveal_cached_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

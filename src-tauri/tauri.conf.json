@@ -25,7 +25,9 @@
     "active": true,
     "targets": "all",
     "resources": [
-      "bin/adb",
+      "bin/adb.exe",
+      "bin/AdbWinApi.dll",
+      "bin/AdbWinUsbApi.dll",
       "bin/daemon"
     ],
     "icon": [
