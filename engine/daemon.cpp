@@ -136,6 +136,7 @@ struct FileNode {
     std::string              path;
     bool                     is_dir = false;
     int64_t                  size   = 0;
+    int64_t                  mtime  = 0;   // seconds since epoch; 0 when unknown
     std::vector<FileNode>    children;
 };
 
@@ -179,6 +180,8 @@ static void serialize_node(JsonStream& out, const FileNode& node) {
     out.write(node.is_dir ? "\"directory\"" : "\"file\"");
     out.write(",\"size\":");
     out.write(std::to_string(node.size));
+    out.write(",\"mtime\":");
+    out.write(std::to_string(node.mtime));
 
     if (node.is_dir) {
         out.write(",\"children\":[");
@@ -205,6 +208,7 @@ static FileNode scan(const std::string& path, const std::string& name,
         ++st.errors;
         return node;
     }
+    node.mtime = static_cast<int64_t>(info.st_mtime);
 
     if (depth > 0 && S_ISLNK(info.st_mode)) return node;
 
