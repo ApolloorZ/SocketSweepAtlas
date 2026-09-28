@@ -449,20 +449,125 @@ fn disconnect_device(app: tauri::AppHandle, target: String) -> Result<String, St
 // The daemon only reports metadata, so viewing a file on the PC means pulling
 // its contents first. Pulled files live in a cache we can reopen instantly.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Emitter;
 
+/// Where pulled copies live. The settings page can point either at any folder;
+/// `None` keeps the platform default so nothing breaks before it is configured.
+static CACHE_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+static DOWNLOAD_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+static CLEAR_CACHE_ON_EXIT: AtomicBool = AtomicBool::new(false);
+
+fn configured(slot: &Mutex<Option<std::path::PathBuf>>) -> Option<std::path::PathBuf> {
+    slot.lock().ok().and_then(|guard| guard.clone())
+}
+
+/// The unconfigured home for both folders. `SOCKETSWEEP_CACHE_DIR` exists so a
+/// dev build can keep its scratch files off the system drive.
+fn default_root(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    if let Ok(custom) = std::env::var("SOCKETSWEEP_CACHE_DIR") {
+        if !custom.is_empty() {
+            return Ok(std::path::PathBuf::from(custom));
+        }
+    }
+    app.path()
+        .app_cache_dir()
+        .map_err(|e| format!("Failed to locate a local folder: {e}"))
+        .map(|dir| dir.join("socketsweep"))
+}
+
+fn ensure_dir(path: std::path::PathBuf, label: &str) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(&path)
+        .map_err(|e| format!("无法创建{label}文件夹 {path:?}:{e}"))?;
+    Ok(path)
+}
+
 fn cache_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    let dir = match std::env::var("SOCKETSWEEP_CACHE_DIR") {
-        Ok(custom) if !custom.is_empty() => std::path::PathBuf::from(custom),
-        _ => app
-            .path()
-            .app_cache_dir()
-            .map_err(|e| format!("Failed to locate a cache folder: {e}"))?
-            .join("socketsweep"),
-    };
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("Failed to create the cache folder {:?}: {e}", dir))?;
-    Ok(dir)
+    match configured(&CACHE_PATH) {
+        Some(path) => ensure_dir(path, "缓存"),
+        None => ensure_dir(default_root(app)?, "缓存"),
+    }
+}
+
+fn download_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    match configured(&DOWNLOAD_PATH) {
+        Some(path) => ensure_dir(path, "下载"),
+        None => ensure_dir(default_root(app)?.join("downloads"), "下载"),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct Paths {
+    cache: String,
+    download: String,
+    cache_custom: bool,
+    download_custom: bool,
+    clear_on_exit: bool,
+}
+
+fn describe_paths(app: &tauri::AppHandle) -> Result<Paths, String> {
+    Ok(Paths {
+        cache: cache_dir(app)?.to_string_lossy().into_owned(),
+        download: download_dir(app)?.to_string_lossy().into_owned(),
+        cache_custom: configured(&CACHE_PATH).is_some(),
+        download_custom: configured(&DOWNLOAD_PATH).is_some(),
+        clear_on_exit: CLEAR_CACHE_ON_EXIT.load(Ordering::Relaxed),
+    })
+}
+
+fn pick(slot: &Mutex<Option<std::path::PathBuf>>, value: Option<String>, label: &str) -> Result<(), String> {
+    let Some(value) = value else { return Ok(()) };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        *slot.lock().map_err(|_| format!("{label}设置无法保存"))? = None;
+        return Ok(());
+    }
+    ensure_dir(std::path::PathBuf::from(trimmed), label)?;
+    *slot.lock().map_err(|_| format!("{label}设置无法保存"))? = Some(std::path::PathBuf::from(trimmed));
+    Ok(())
+}
+
+/// Reads or updates the two folders and the exit switch in one round trip; the
+/// UI sends only the fields it is changing and always gets the full state back.
+#[tauri::command(async)]
+fn set_paths(
+    app: tauri::AppHandle,
+    cache: Option<String>,
+    download: Option<String>,
+    clear_on_exit: Option<bool>,
+) -> Result<String, String> {
+    pick(&CACHE_PATH, cache, "缓存")?;
+    pick(&DOWNLOAD_PATH, download, "下载")?;
+    if let Some(flag) = clear_on_exit {
+        CLEAR_CACHE_ON_EXIT.store(flag, Ordering::Relaxed);
+    }
+    serde_json::to_string(&describe_paths(&app)?).map_err(|e| e.to_string())
+}
+
+/// Which of the two folders a command should act on.
+fn dir_for(app: &tauri::AppHandle, kind: &str) -> Result<std::path::PathBuf, String> {
+    match kind {
+        "download" => download_dir(app),
+        _ => cache_dir(app),
+    }
+}
+
+#[tauri::command(async)]
+fn dir_stats(app: tauri::AppHandle, kind: String) -> Result<String, String> {
+    let dir = dir_for(&app, &kind)?;
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    files += 1;
+                    bytes += meta.len();
+                }
+            }
+        }
+    }
+    Ok(serde_json::json!({ "files": files, "bytes": bytes, "path": dir.to_string_lossy() }).to_string())
 }
 
 /// Flattens a device path into a single safe file name, e.g.
@@ -494,22 +599,103 @@ fn cached_files(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// Pulls `device_path` into the cache, reporting progress as it goes, and
-/// optionally hands it to the OS default application. Returns the local path.
+fn cache_files(app: &tauri::AppHandle) -> Result<Vec<(std::path::PathBuf, u64, std::time::SystemTime)>, String> {
+    let dir = cache_dir(app)?;
+    let mut out = Vec::new();
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("读取缓存目录失败:{e}"))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_file() {
+            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            out.push((path, meta.len(), mtime));
+        }
+    }
+    Ok(out)
+}
+
+/// Deletes cached copies, oldest first, until the folder fits under
+/// `limit_bytes`; `all` empties it regardless.
+#[tauri::command(async)]
+fn trim_cache(app: tauri::AppHandle, limit_bytes: i64, all: bool) -> Result<String, String> {
+    let mut files = cache_files(&app)?;
+    files.sort_by(|a, b| a.2.cmp(&b.2));
+    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+    let limit = limit_bytes.max(0) as u64;
+    let mut removed = 0u64;
+    let mut freed = 0u64;
+
+    for (path, len, _) in files {
+        if !all && total <= limit {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
+            removed += 1;
+            freed += len;
+        }
+    }
+
+    Ok(serde_json::json!({ "removed": removed, "freed": freed, "bytes": total }).to_string())
+}
+
+/// Picks a name inside the download folder: reuses a byte-identical copy that is
+/// already there, and never overwrites a different file that shares the name.
+fn download_target(dir: &std::path::Path, device_path: &str, size: i64) -> std::path::PathBuf {
+    let base = device_path.rsplit('/').next().unwrap_or(device_path);
+    let safe: String = base
+        .chars()
+        .map(|c| match c {
+            ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            other => other,
+        })
+        .collect();
+    let (stem, ext) = match safe.rsplit_once('.') {
+        Some((head, tail)) if !head.is_empty() && !tail.is_empty() => (head.to_string(), Some(tail.to_string())),
+        _ => (safe.clone(), None),
+    };
+
+    let mut index = 1usize;
+    loop {
+        let name = match (&stem, &ext) {
+            (_, Some(_)) if index == 1 => safe.clone(),
+            (_, Some(e)) => format!("{stem} ({index}).{e}"),
+            (s, None) if index == 1 => s.clone(),
+            (s, None) => format!("{s} ({index})"),
+        };
+        let candidate = dir.join(name);
+        match candidate.metadata() {
+            Ok(meta) if meta.len() as i64 == size => return candidate,
+            Ok(_) => index += 1,
+            Err(_) => return candidate,
+        }
+    }
+}
+
+/// Pulls `device_path` to the PC, reporting progress as it goes, and optionally
+/// hands it to the OS default application. Returns the local path.
+///
+/// `kind` chooses the folder: "cache" is auto-trimmed scratch space for opening
+/// files, "download" keeps the copy under its own name.
 #[tauri::command(async)]
 fn pull_file(
     app: tauri::AppHandle,
     device_path: String,
     size: i64,
     open: bool,
+    kind: Option<String>,
 ) -> Result<String, String> {
     use tauri_plugin_opener::OpenerExt;
 
     let adb_path = get_bundled_binary(&app, "adb")?;
-    let local = cache_dir(&app)?.join(cached_file_name(&device_path));
+    let local = if kind.as_deref() == Some("download") {
+        download_target(&download_dir(&app)?, &device_path, size)
+    } else {
+        cache_dir(&app)?.join(cached_file_name(&device_path))
+    };
     let local_str = local
         .to_str()
-        .ok_or_else(|| format!("Cache path is not valid text: {:?}", local))?
+        .ok_or_else(|| format!("Local path is not valid text: {:?}", local))?
         .to_string();
 
     let already_cached = size > 0
@@ -558,16 +744,16 @@ fn pull_file(
 }
 
 #[tauri::command(async)]
-fn reveal_cached_folder(app: tauri::AppHandle) -> Result<String, String> {
+fn reveal_folder(app: tauri::AppHandle, kind: String) -> Result<String, String> {
     use tauri_plugin_opener::OpenerExt;
-    let dir = cache_dir(&app)?;
+    let dir = dir_for(&app, &kind)?;
     let path = dir
         .to_str()
-        .ok_or_else(|| format!("Cache path is not valid text: {:?}", dir))?
+        .ok_or_else(|| format!("Path is not valid text: {:?}", dir))?
         .to_string();
     app.opener()
         .open_path(&path, None::<&str>)
-        .map_err(|e| format!("Could not open the cache folder: {e}"))?;
+        .map_err(|e| format!("打不开这个文件夹:{e}"))?;
     Ok(path)
 }
 
@@ -601,6 +787,7 @@ fn wireless_auto_connect(app: tauri::AppHandle) -> Result<String, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             check_adb,
             init_daemon,
@@ -616,10 +803,24 @@ pub fn run() {
             start_qr_pairing,
             cancel_qr_pairing,
             wireless_auto_connect,
+            set_paths,
+            dir_stats,
             cached_files,
+            trim_cache,
             pull_file,
-            reveal_cached_folder,
+            reveal_folder,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            // Emptying the cache on exit only happens because the settings page
+            // asked for it; downloads are never touched here.
+            if matches!(event, tauri::RunEvent::Exit) && CLEAR_CACHE_ON_EXIT.load(Ordering::Relaxed) {
+                if let Ok(files) = cache_files(app) {
+                    for (path, _, _) in files {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+        });
 }

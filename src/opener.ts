@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { callBackend, isMockMode } from "./backend";
+import { MB, readSettings } from "./settings";
 import type { FileNode } from "./types";
 
 // Measured on the owner's Redmi K40 over USB: ~38 MB/s, plus ~200 ms of adb
-// startup per file. Anything above this threshold asks before pulling.
-export const LARGE_FILE_BYTES = 300 * 1024 * 1024;
-export const PULL_BYTES_PER_SEC = 38 * 1024 * 1024;
+// startup per file.
+export const PULL_BYTES_PER_SEC = 38 * MB;
 
 export function cachedNameFor(devicePath: string): string {
   return devicePath
@@ -68,10 +68,17 @@ export function useFileOpener() {
     [cached]
   );
 
+  // Pulling is the only thing that grows the cache, so trimming happens here.
+  const trimCache = useCallback(() => {
+    if (isMockMode) return;
+    callBackend<string>("trim_cache", { limitBytes: readSettings().cacheLimitMb * MB }).catch(() => undefined);
+  }, []);
+
   const openFile = useCallback(
     async (node: FileNode, skipSizeCheck = false) => {
       if (node.type === "directory") return;
-      if (!skipSizeCheck && !isCached(node) && node.size > LARGE_FILE_BYTES) {
+      const limit = readSettings().largeFileMb * MB;
+      if (!skipSizeCheck && !isCached(node) && node.size > limit) {
         setPendingLarge(node);
         return;
       }
@@ -89,15 +96,17 @@ export function useFileOpener() {
           });
         }
         setCached((prev) => new Set(prev).add(cachedNameFor(node.path)));
+        trimCache();
       } catch (err: unknown) {
         setError(err instanceof Error ? err.message : String(err));
       } finally {
         window.setTimeout(() => setPull(null), 900);
       }
     },
-    [isCached]
+    [isCached, trimCache]
   );
 
+  /** 下载所选: keep the copies in the download folder, under their own names. */
   const downloadFiles = useCallback(async (nodes: FileNode[]) => {
     const todo = nodes.filter((n) => n.type === "file" && !isCached(n));
     if (todo.length === 0) return 0;
@@ -110,9 +119,8 @@ export function useFileOpener() {
         if (isMockMode) {
           await new Promise((r) => setTimeout(r, 500));
         } else {
-          await callBackend<string>("pull_file", { devicePath: node.path, size: node.size, open: false });
+          await callBackend<string>("pull_file", { devicePath: node.path, size: node.size, open: false, kind: "download" });
         }
-        setCached((prev) => new Set(prev).add(cachedNameFor(node.path)));
         done += 1;
       } catch (err: unknown) {
         setError(err instanceof Error ? err.message : String(err));
@@ -123,15 +131,6 @@ export function useFileOpener() {
     setDownloading(false);
     return done;
   }, [isCached]);
-
-  const revealFolder = useCallback(async () => {
-    if (isMockMode) return;
-    try {
-      await callBackend<string>("reveal_cached_folder");
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }, []);
 
   return {
     cached,
@@ -145,7 +144,6 @@ export function useFileOpener() {
     openFile,
     downloadFiles,
     downloading,
-    revealFolder,
     refreshCache,
   };
 }

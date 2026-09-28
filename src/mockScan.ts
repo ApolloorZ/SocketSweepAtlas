@@ -138,8 +138,14 @@ export const MOCK_CAPACITY = {
   free_bytes: 20870692 * 1024,
 };
 
-export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise<string> {
-  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// Pretend the PC already holds copies in both folders so the settings page has
+// something to report and clearing it visibly changes the number.
+const mockDirs: Record<string, { files: number; bytes: number; path: string }> = {
+  cache: { files: 12, bytes: Math.round(318.4 * 1024 * 1024), path: "F:\\dev\\socketsweep-cache" },
+  download: { files: 3, bytes: Math.round(742 * 1024 * 1024), path: "F:\\dev\\mock-folder\\downloads" },
+};
+
+export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise<string> {  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
   // `?fail=1` in the dev browser exercises the failure path (error card, retry).
   const failing = new URLSearchParams(window.location.search).get("fail");
   if (failing && cmd === (failing || "init_daemon")) {
@@ -198,6 +204,47 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
       return wait(300).then(() => `disconnected ${args?.target ?? ""}`);
     case "get_storage_info":
       return wait(200).then(() => JSON.stringify(MOCK_CAPACITY));
+    case "set_paths": {
+      return wait(200).then(() => {
+        const cache = typeof args?.cache === "string" ? args.cache : null;
+        const download = typeof args?.download === "string" ? args.download : null;
+        if (cache !== null) mockDirs.cache.path = cache || "F:\\dev\\socketsweep-cache";
+        if (download !== null) mockDirs.download.path = download || "F:\\dev\\mock-folder\\downloads";
+        return JSON.stringify({
+          cache: mockDirs.cache.path,
+          download: mockDirs.download.path,
+          cacheCustom: Boolean(cache),
+          downloadCustom: Boolean(download),
+          clearOnExit: Boolean(args?.clearOnExit),
+        });
+      });
+    }
+    case "dir_stats": {
+      const dir = mockDirs[String(args?.kind ?? "cache")] ?? mockDirs.cache;
+      return wait(200).then(() => JSON.stringify(dir));
+    }
+    case "reveal_folder":
+      return wait(200).then(() => mockDirs[String(args?.kind ?? "cache")]?.path ?? mockDirs.cache.path);
+    case "trim_cache": {
+      return wait(400).then(() => {
+        const before = { ...mockDirs.cache };
+        const limit = Number(args?.limitBytes ?? 0);
+        if (args?.all || before.bytes <= limit) {
+          mockDirs.cache = { ...before, files: 0, bytes: 0 };
+        } else {
+          mockDirs.cache = {
+            ...before,
+            files: Math.max(1, Math.round(before.files * limit / Math.max(1, before.bytes))),
+            bytes: limit,
+          };
+        }
+        return JSON.stringify({
+          removed: before.files - mockDirs.cache.files,
+          freed: before.bytes - mockDirs.cache.bytes,
+          bytes: mockDirs.cache.bytes,
+        });
+      });
+    }
     case "ping_daemon":
       return Promise.resolve(JSON.stringify({ status: "ok", message: "pong" }));
     case "stop_daemon":

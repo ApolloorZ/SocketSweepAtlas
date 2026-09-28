@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { callBackend, isMockMode } from "./backend";
 import { EmptyScanScreen, ResultView } from "./ResultView";
 import { DevicePanel } from "./DevicePanel";
+import { SettingsPanel } from "./SettingsPanel";
+import { useSettings } from "./settings";
 import { removeNode } from "./tree";
 import { formatBytes, formatNumber } from "./format";
 import type { AppPhase, Capacity, ScanResponse, Toast } from "./types";
@@ -84,6 +86,15 @@ function IconWifi() {
       <path d="M5.5 12.2a10.5 10.5 0 0 1 13 0" />
       <path d="M8.5 15.9a6 6 0 0 1 7 0" />
       <circle cx="12" cy="19.5" r="1.2" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+function IconGear() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1.08 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
     </svg>
   );
 }
@@ -391,9 +402,8 @@ function SetupScreen({
           </div>
 
           <div className="flex flex-col items-center gap-1.5 text-xs text-zinc-600">
-            <p>· 手机上不用装任何 App,也不需要 root</p>
-            <p>· 无线连接第一次要配对(扫一次码或输一次 6 位码),以后点一下就自动连上并开始扫描</p>
-            <p>· 有些数据线只能充电,检测不到设备时先换根线</p>
+            <p>· 手机不用装 App,也不需要 root</p>
+            <p>· 无线第一次要配对一次,以后点一下就自动连上并开始扫描</p>
           </div>
 
           <button
@@ -432,7 +442,7 @@ function ScanningScreen({ steps, elapsedMs, onCancel }: { steps: Step[]; elapsed
 
       <div className="text-center">
         <h2 className="text-lg font-semibold text-zinc-200">正在扫描手机存储</h2>
-        <p className="mt-1 text-xs text-zinc-600">文件越多耗时越久,一般 10–60 秒,期间不要拔线</p>
+        <p className="mt-1 text-xs text-zinc-600">一般 10–60 秒,期间不要拔线</p>
       </div>
 
       <StepList steps={steps} />
@@ -450,15 +460,14 @@ function App() {
   const [capacity, setCapacity] = useState<Capacity | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
-  const [logsOpen, setLogsOpen] = useState(false);
+  const { settings, patch: patchSettings } = useSettings();
+  const [logsOpen, setLogsOpen] = useState(settings.logsOpen);
   const [steps, setSteps] = useState<Step[]>(() => stepsFor("usb"));
   const [elapsedMs, setElapsedMs] = useState(0);
   const [flowError, setFlowError] = useState<{ message: string; hints: string[] } | null>(null);
-  const [theme, setTheme] = useState<"dark" | "light">(() =>
-    localStorage.getItem("ss-theme") === "light" ? "light" : "dark"
-  );
   const [target, setTarget] = useState<string | null>(() => localStorage.getItem("ss-target"));
   const [mode, setMode] = useState<ConnectMode>("usb");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   // null = closed; "pair" is opened by the wireless flow when Android still needs
   // proof of physical presence, "manage" is the user opening it themselves.
   const [panel, setPanel] = useState<{ intent: "manage" | "pair"; endpoint: string | null } | null>(null);
@@ -469,9 +478,19 @@ function App() {
   }, [target]);
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    localStorage.setItem("ss-theme", theme);
-  }, [theme]);
+    document.documentElement.dataset.theme = settings.theme;
+  }, [settings.theme]);
+
+  // The two folders live in Rust, which is where every file operation happens.
+  // The settings page reports failures itself; this only keeps both in step.
+  useEffect(() => {
+    if (isMockMode) return;
+    callBackend<string>("set_paths", {
+      cache: settings.cachePath,
+      download: settings.downloadPath,
+      clearOnExit: settings.clearCacheOnExit,
+    }).catch(() => undefined);
+  }, [settings.cachePath, settings.downloadPath, settings.clearCacheOnExit]);
 
   const timerRefs = useRef<Map<number, ReturnType<typeof setTimeout>>>(new Map());
   const runIdRef = useRef(0);
@@ -792,7 +811,11 @@ function App() {
       <div className="shrink-0 border-t border-zinc-800/80 bg-zinc-950">
         <div className="flex items-center gap-3 px-4 py-1.5">
           <button
-            onClick={() => setLogsOpen((v) => !v)}
+            onClick={() => {
+              const next = !logsOpen;
+              setLogsOpen(next);
+              patchSettings({ logsOpen: next });
+            }}
             className="flex items-center gap-2 text-[11px] text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer"
           >
             <IconChevron open={logsOpen} />
@@ -802,24 +825,30 @@ function App() {
           <div className="ml-auto flex items-center gap-3">
             {flowError && <span className="text-[11px] text-danger-400">最近一次操作有错误</span>}
             <button
-              id="btn-theme"
-              role="switch"
-              aria-checked={theme === "light"}
-              aria-label="切换深浅主题"
-              title={theme === "dark" ? "切换到浅色" : "切换到深色"}
-              onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
-              className="relative w-14 h-7 rounded-full border transition-colors duration-300 cursor-pointer shrink-0"
-              style={{ background: "var(--toggle-track)", borderColor: "var(--color-zinc-700)" }}
+              id="btn-settings"
+              onClick={() => setSettingsOpen(true)}
+              title="设置"
+              aria-label="打开设置"
+              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer shrink-0"
             >
-              <span
-                className="absolute left-0.5 top-0.5 w-6 h-6 rounded-full bg-white shadow-md transition-transform duration-300 ease-out"
-                style={{ transform: theme === "light" ? "translateX(28px)" : "translateX(0)" }}
-              />
+              <IconGear />
+              设置
             </button>
           </div>
         </div>
         {logsOpen && <TerminalLog logs={logs} />}
       </div>
+
+      {settingsOpen && (
+        <SettingsPanel
+          settings={settings}
+          onPatch={patchSettings}
+          target={target}
+          onResetTarget={() => setTarget(null)}
+          onOpenDevices={() => setPanel({ intent: "manage", endpoint: null })}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
 
       {panel && (
         <DevicePanel

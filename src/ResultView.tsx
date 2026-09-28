@@ -385,7 +385,7 @@ export function ResultView({
                 <span className="flex-1">
                   <span className="block text-sm font-semibold text-zinc-200">所有文件</span>
                   <span className="block text-xs text-zinc-500 mt-0.5">
-                    按目录逐层查看,占用从多到少排列;单击文件可勾选,双击可拉到电脑上打开
+                    按目录逐层查看 · 单击勾选 · 双击拉到电脑上打开
                   </span>
                 </span>
                 <span className="text-2xl font-bold font-mono text-accent-400">{formatBytes(data.total_size)}</span>
@@ -510,7 +510,7 @@ export function ResultView({
             <button
               onClick={() => opener.downloadFiles([...selected.values()])}
               disabled={selectedFiles.length === 0 || opener.downloading}
-              title={selectedFiles.length === 0 ? "所选里没有可下载的文件(文件夹不能直接下载)" : "把所选文件拉到电脑缓存,不自动打开"}
+              title={selectedFiles.length === 0 ? "所选里没有可下载的文件(文件夹不能直接下载)" : "把所选文件拉到电脑的下载文件夹,保留原文件名,不自动打开"}
               className="px-4 py-2 rounded-lg text-sm font-semibold bg-zinc-800 text-accent-400 border border-accent-500/30 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
             >
               {opener.downloading ? "正在下载…" : "⬇ 下载所选"}
