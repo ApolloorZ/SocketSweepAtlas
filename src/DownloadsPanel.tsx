@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { callBackend } from "./backend";
 import { formatBytes, formatDate } from "./format";
-import { estimatedSeconds, type QueueItem } from "./opener";
+import { CANCELLED, estimatedSeconds, type QueueItem } from "./opener";
 import { Panel } from "./Panel";
 
 interface Downloaded {
@@ -27,6 +27,9 @@ const DIRECTION_LABEL: Record<QueueItem["direction"], string> = {
 function QueueRow({ item }: { item: QueueItem }) {
   const ratio = item.size > 0 ? Math.min(1, item.done / item.size) : 0;
   const left = Math.max(0, item.size - item.done);
+  // A transfer the user stopped is not a fault, so it is not dressed as one.
+  const cancelled = item.state === "failed" && item.error === CANCELLED;
+  const bad = item.state === "failed" && !cancelled;
   return (
     <div className="py-2.5 border-b border-zinc-800/70 last:border-b-0">
       <div className="flex items-center gap-2.5">
@@ -38,10 +41,10 @@ function QueueRow({ item }: { item: QueueItem }) {
         </span>
         <span
           className={`text-[11px] shrink-0 ${
-            item.state === "failed" ? "text-danger-400" : item.state === "done" ? "text-emerald-400" : "text-zinc-500"
+            bad ? "text-danger-400" : cancelled ? "text-zinc-500" : item.state === "done" ? "text-emerald-400" : "text-zinc-500"
           }`}
         >
-          {STATE_LABEL[item.state]}
+          {cancelled ? "已取消" : STATE_LABEL[item.state]}
           {item.state === "active" && item.size > 0 && ` ${Math.round(ratio * 100)}%`}
           {item.state === "active" && item.size > 0 && left > 0 && ` · 约 ${estimatedSeconds(left)} 秒`}
         </span>
@@ -49,12 +52,12 @@ function QueueRow({ item }: { item: QueueItem }) {
       <div className="mt-1.5 h-1 rounded-full bg-zinc-800 overflow-hidden">
         <div
           className={`h-full rounded-full transition-[width] duration-200 ${
-            item.state === "failed" ? "bg-danger-500" : item.state === "active" && item.size === 0 ? "bg-accent-500/40" : "bg-accent-500"
+            bad ? "bg-danger-500" : item.state === "active" && item.size === 0 ? "bg-accent-500/40" : "bg-accent-500"
           }`}
           style={{ width: `${item.size === 0 && item.state === "active" ? 100 : Math.round(ratio * 100)}%` }}
         />
       </div>
-      {item.error && <p className="mt-1 text-[11px] text-zinc-600 break-words">{item.error}</p>}
+      {item.error && !cancelled && <p className="mt-1 text-[11px] text-zinc-600 break-words">{item.error}</p>}
     </div>
   );
 }
@@ -63,11 +66,13 @@ function QueueRow({ item }: { item: QueueItem }) {
 export function DownloadsPanel({
   queue,
   onOpenFolder,
+  onCancel,
   onClear,
   onClose,
 }: {
   queue: QueueItem[];
   onOpenFolder: () => void;
+  onCancel: () => void;
   onClear: () => void;
   onClose: () => void;
 }) {
@@ -102,12 +107,24 @@ export function DownloadsPanel({
       title="传输"
       onClose={onClose}
       actions={
-        <button
-          onClick={onOpenFolder}
-          className="px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 cursor-pointer shrink-0"
-        >
-          打开文件夹
-        </button>
+        <div className="flex items-center gap-2 shrink-0">
+          {active.length > 0 && (
+            <button
+              id="btn-cancel-batch"
+              onClick={onCancel}
+              title="停止当前传输:半途的文件不会留在电脑上或手机上"
+              className="px-3 py-1.5 rounded-lg text-xs font-medium text-zinc-400 hover:text-zinc-100 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700/50 cursor-pointer"
+            >
+              取消传输
+            </button>
+          )}
+          <button
+            onClick={onOpenFolder}
+            className="px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 cursor-pointer"
+          >
+            打开文件夹
+          </button>
+        </div>
       }
     >
       <section>

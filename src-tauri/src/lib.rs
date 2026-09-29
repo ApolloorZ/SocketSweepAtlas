@@ -431,6 +431,20 @@ fn free_remote_name(adb_path: &std::path::Path, dir: &str, name: &str) -> Result
     }
 }
 
+/// Sizes of the files about to be uploaded. The front end adds them up and
+/// compares against the phone's free space before any byte is sent.
+#[tauri::command(async)]
+fn local_file_sizes(paths: Vec<String>) -> Result<String, String> {
+    let out: Vec<serde_json::Value> = paths
+        .iter()
+        .map(|path| {
+            let bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+            serde_json::json!({ "path": path, "bytes": bytes })
+        })
+        .collect();
+    serde_json::to_string(&out).map_err(|e| format!("Failed to report file sizes: {e}"))
+}
+
 /// Copies a local file into a folder on the phone and reports progress.
 #[tauri::command(async)]
 fn push_file(app: tauri::AppHandle, local_path: String, device_dir: String) -> Result<String, String> {
@@ -462,6 +476,7 @@ fn push_file(app: tauri::AppHandle, local_path: String, device_dir: String) -> R
     args.push(local_path.clone());
     args.push(remote.clone());
 
+    CANCEL_TRANSFER.store(false, Ordering::Relaxed);
     let mut child = Command::new(&adb_path)
         .args(&args)
         .stdout(std::process::Stdio::null())
@@ -469,24 +484,27 @@ fn push_file(app: tauri::AppHandle, local_path: String, device_dir: String) -> R
         .spawn()
         .map_err(|e| format!("上传没能启动:{e}"))?;
 
-    while let Ok(None) = child.try_wait() {
-        let probe = format!("stat -c %s {} 2>/dev/null", shell_quote(&remote));
-        let done = device_shell(&adb_path, probe)
-            .ok()
-            .and_then(|text| text.trim().parse::<i64>().ok())
-            .unwrap_or(0);
-        let _ = app.emit(
-            "push-progress",
-            serde_json::json!({ "path": local_path, "done": done, "total": size }),
-        );
-        std::thread::sleep(Duration::from_millis(500));
-    }
-
-    let status = child
-        .wait()
-        .map_err(|e| format!("上传没能结束:{e}"))?;
-    if !status.success() {
-        return Err(format!("上传失败:{raw}"));
+    let pushed = wait_for_transfer(
+        &app,
+        &mut child,
+        "push-progress",
+        &local_path,
+        size,
+        "上传",
+        &|| {
+            let probe = format!("stat -c %s {} 2>/dev/null", shell_quote(&remote));
+            device_shell(&adb_path, probe)
+                .ok()
+                .and_then(|text| text.trim().parse::<i64>().ok())
+                .unwrap_or(0)
+        },
+        // The half-written file is on the phone, not here.
+        None,
+    );
+    if let Err(err) = pushed {
+        // Leave no truncated copy behind on the device.
+        let _ = device_shell(&adb_path, format!("rm -f {}", shell_quote(&remote)));
+        return Err(err);
     }
 
     Ok(serde_json::json!({ "remote": remote, "name": target, "bytes": size }).to_string())
@@ -569,41 +587,84 @@ struct DeviceInfo {
     model: String,
     kind: String,
     status: String,
+    /// Every adb transport that belongs to this one phone.
+    transports: Vec<String>,
+    #[serde(skip)]
+    key: String,
 }
 
 #[tauri::command(async)]
 fn list_devices(app: tauri::AppHandle) -> Result<String, String> {
     let adb_path = get_bundled_binary(&app, "adb")?;
     let output = adb(&adb_path, &["devices", "-l"])?;
+    let pinned = device_serial();
 
-    let mut devices = Vec::new();
+    let mut groups: Vec<DeviceInfo> = Vec::new();
     // `adb devices -l` pads columns with spaces, so split on whitespace rather
     // than relying on the tab that plain `adb devices` uses.
     for line in output.lines().skip(1) {
-        let line = line.trim();
-        let mut cols = line.split_whitespace();
+        let mut cols = line.trim().split_whitespace();
         let (Some(serial), Some(status)) = (cols.next(), cols.next()) else { continue };
         if serial == "List" || serial.starts_with('*') {
             continue;
         }
-        let model = cols
-            .find(|c| c.starts_with("model:"))
-            .map(|c| c["model:".len()..].replace('_', " "))
-            .unwrap_or_default();
-
-        // Wireless devices appear either as ip:port or under the name adb gives an
-        // mDNS-discovered transport, e.g. adb-982b7b0a-xxxx._adb-tls-connect._tcp
+        let rest: Vec<&str> = cols.collect();
+        let field = |name: &str| rest.iter().find_map(|c| c.strip_prefix(name)).unwrap_or_default();
+        let model = field("model:").replace('_', " ");
+        // One phone can hold several transports at once — plugged in, paired over
+        // Wi-Fi, discovered by mDNS — and they all report the same product/model.
+        // Showing them as separate devices reads like a bug and invites picking
+        // the wrong one, so they collapse into a single row.
+        let key = match (field("product:"), model.as_str()) {
+            ("", "") => format!("#{serial}"),
+            (product, model) => format!("{product}|{model}"),
+        };
+        if let Some(group) = groups.iter_mut().find(|d| d.key == key) {
+            group.transports.push(serial.to_string());
+            if group.status != "device" && status == "device" {
+                group.status = status.to_string();
+            }
+            continue;
+        }
         let wireless = pairing::is_wireless_serial(serial);
-
-        devices.push(DeviceInfo {
+        groups.push(DeviceInfo {
             serial: serial.to_string(),
             model,
             kind: if wireless { "wireless".into() } else { "usb".into() },
             status: status.to_string(),
+            transports: vec![serial.to_string()],
+            key,
         });
     }
 
-    serde_json::to_string(&devices).map_err(|e| format!("Failed to describe devices: {e}"))
+    for group in groups.iter_mut() {
+        // A phone on the cable *and* on Wi-Fi is faster and steadier over USB, so
+        // the row leads with the wired transport when both are alive.
+        let chosen = pinned
+            .as_ref()
+            .filter(|pinned| group.transports.iter().any(|t| t.as_str() == pinned.as_str()))
+            .cloned()
+            .or_else(|| {
+                group
+                    .transports
+                    .iter()
+                    .find(|t| !pairing::is_wireless_serial(t))
+                    .cloned()
+            })
+            .or_else(|| {
+                group
+                    .transports
+                    .iter()
+                    .find(|t| t.contains("_adb-tls-connect"))
+                    .cloned()
+            })
+            .or_else(|| group.transports.iter().find(|t| t.contains(':')).cloned())
+            .unwrap_or_else(|| group.serial.clone());
+        group.serial = chosen;
+        group.kind = if pairing::is_wireless_serial(&group.serial) { "wireless".into() } else { "usb".into() };
+    }
+
+    serde_json::to_string(&groups).map_err(|e| format!("Failed to describe devices: {e}"))
 }
 
 #[tauri::command(async)]
@@ -988,6 +1049,56 @@ fn download_target(dir: &std::path::Path, device_path: &str, size: i64) -> std::
     }
 }
 
+/// Set by the transfer panel's 取消 button; the running pull/poll loop kills the
+/// adb child as soon as it sees it.
+static CANCEL_TRANSFER: AtomicBool = AtomicBool::new(false);
+
+#[tauri::command(async)]
+fn cancel_transfer() -> Result<String, String> {
+    CANCEL_TRANSFER.store(true, Ordering::Relaxed);
+    Ok("{\"status\":\"cancelling\"}".into())
+}
+
+/// Poll an adb child until it exits, reporting `done` bytes as it goes so the UI
+/// can show progress, and honouring the cancel switch.
+fn wait_for_transfer(
+    app: &tauri::AppHandle,
+    child: &mut std::process::Child,
+    event: &str,
+    key: &str,
+    size: i64,
+    what: &str,
+    probe: &dyn Fn() -> i64,
+    partial: Option<&std::path::Path>,
+) -> Result<(), String> {
+    while let Ok(None) = child.try_wait() {
+        if CANCEL_TRANSFER.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(path) = partial {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err("已取消。".into());
+        }
+        let done = probe();
+        let _ = app.emit(
+            event,
+            serde_json::json!({ "path": key, "done": done, "total": size }),
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("{what}没能正常结束:{e}"))?;
+    if !status.success() {
+        if let Some(path) = partial {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(format!("{what}失败,手机或数据线可能中途断开了。"));
+    }
+    Ok(())
+}
+
 /// Pulls `device_path` to the PC, reporting progress as it goes, and optionally
 /// hands it to the OS default application. Returns the local path.
 ///
@@ -1041,6 +1152,7 @@ fn pull_file(
         }
         args.extend(["pull", device_path.as_str(), local_str.as_str()]);
 
+        CANCEL_TRANSFER.store(false, Ordering::Relaxed);
         let mut child = Command::new(&adb_path)
             .args(&args)
             .stdout(std::process::Stdio::null())
@@ -1048,22 +1160,16 @@ fn pull_file(
             .spawn()
             .map_err(|e| format!("Failed to start adb pull: {e}"))?;
 
-        while let Ok(None) = child.try_wait() {
-            let done = std::fs::metadata(&local).map(|m| m.len() as i64).unwrap_or(0);
-            let _ = app.emit(
-                "pull-progress",
-                serde_json::json!({ "path": device_path, "done": done, "total": size }),
-            );
-            std::thread::sleep(Duration::from_millis(200));
-        }
-
-        let status = child
-            .wait()
-            .map_err(|e| format!("adb pull could not finish: {e}"))?;
-        if !status.success() {
-            let _ = std::fs::remove_file(&local);
-            return Err(format!("adb pull failed for {device_path}"));
-        }
+        wait_for_transfer(
+            &app,
+            &mut child,
+            "pull-progress",
+            &device_path,
+            size,
+            "拉取",
+            &|| std::fs::metadata(&local).map(|m| m.len() as i64).unwrap_or(0),
+            Some(&local),
+        )?;
 
         // Give the copy the phone's timestamp so the next comparison means something.
         if mtime > 0 {
@@ -1143,6 +1249,7 @@ pub fn run() {
             delete_item,
             move_items,
             push_file,
+            local_file_sizes,
             list_devices,
             pair_device,
             connect_device,
@@ -1157,6 +1264,7 @@ pub fn run() {
             cached_entries,
             trim_cache,
             pull_file,
+            cancel_transfer,
             reveal_folder,
         ])
         .build(tauri::generate_context!())

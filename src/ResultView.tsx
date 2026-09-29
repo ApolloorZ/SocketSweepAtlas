@@ -362,6 +362,7 @@ export function ResultView({
   const [painting, setPainting] = useState(false);
   const rowsRef = useRef(rows);
   rowsRef.current = rows;
+  const listRef = useRef<HTMLDivElement>(null);
 
   const startPaint = (node: FileNode, event: React.PointerEvent) => {
     event.preventDefault();
@@ -379,11 +380,14 @@ export function ResultView({
 
   useEffect(() => {
     if (!painting) return;
-    const onMove = (event: PointerEvent) => {
+    const list = listRef.current;
+    const point = { x: 0, y: 0 };
+    let dir = 0;
+
+    const applyTo = (x: number, y: number) => {
       const current = paint.current;
       if (!current) return;
-      const row = document.elementFromPoint(event.clientX, event.clientY)?.closest(".file-row");
-      const path = row?.getAttribute("data-path");
+      const path = document.elementFromPoint(x, y)?.closest(".file-row")?.getAttribute("data-path");
       if (!path) return;
       setSelected((prev) => {
         const node = rowsRef.current.find((n) => n.path === path);
@@ -394,6 +398,33 @@ export function ResultView({
         return next;
       });
     };
+
+    const onMove = (event: PointerEvent) => {
+      point.x = event.clientX;
+      point.y = event.clientY;
+      if (list) {
+        // Hovering the last rows of a long folder should not require an extra
+        // hand on the scrollbar, so the edge of the list takes over.
+        const box = list.getBoundingClientRect();
+        dir = event.clientY < box.top + 44 ? -1 : event.clientY > box.bottom - 44 ? 1 : 0;
+      }
+      applyTo(event.clientX, event.clientY);
+    };
+
+    // Painting keeps going while the pointer holds still at the edge, which is
+    // how a drag from the top of a folder to the bottom actually ends up felt.
+    let raf = 0;
+    const loop = () => {
+      if (dir !== 0 && list) {
+        const before = list.scrollTop;
+        const span = list.scrollHeight - list.clientHeight;
+        list.scrollTop = Math.max(0, Math.min(span, before + dir * 10));
+        if (list.scrollTop !== before) applyTo(point.x, point.y);
+      }
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+
     const stop = () => {
       paint.current = null;
       setPainting(false);
@@ -402,6 +433,7 @@ export function ResultView({
     window.addEventListener("pointerup", stop);
     window.addEventListener("pointercancel", stop);
     return () => {
+      cancelAnimationFrame(raf);
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", stop);
       window.removeEventListener("pointercancel", stop);
@@ -569,6 +601,16 @@ export function ResultView({
                 </span>
               </>
             )}
+            {opener.busy && (
+              <button
+                id="btn-cancel-transfer"
+                onClick={opener.cancelTransfer}
+                title="停止当前传输:半途的文件不会留在电脑上或手机上"
+                className="ml-auto px-2.5 py-1 rounded-md text-[11px] font-medium text-zinc-400 hover:text-zinc-100 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700/50 cursor-pointer shrink-0"
+              >
+                取消传输
+              </button>
+            )}
           </div>
           {rows.length > 0 && (
             <button
@@ -599,7 +641,7 @@ export function ResultView({
         </div>
       )}
 
-      <div className={`flex-1 min-h-0 overflow-y-auto ${painting ? "select-none" : ""}`}>
+      <div ref={listRef} className={`flex-1 min-h-0 overflow-y-auto ${painting ? "select-none" : ""}`}>
         {view === "home" && (
           <div className="px-5 py-4 flex flex-col gap-4">
             {/* ① Treemap of level-1 folders */}
@@ -811,11 +853,11 @@ export function ResultView({
                     // done their job and only get in the way.
                     setSelected(new Map());
                   }}
-                  disabled={selectedFiles.length === 0 || opener.downloading}
+                  disabled={selectedFiles.length === 0 || opener.busy}
                   title={selectedFiles.length === 0 ? "所选里没有可下载的文件(文件夹不能直接下载)" : "把所选文件拉到电脑的下载文件夹,保留原文件名,不自动打开"}
                   className="px-4 py-2 rounded-lg text-sm font-semibold bg-zinc-800 text-accent-400 border border-accent-500/30 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
                 >
-                  {opener.downloading ? "正在下载…" : "⬇ 下载所选"}
+                  {opener.busy ? "正在传输…" : "⬇ 下载所选"}
                 </button>
                 {view === "browse" && (
                   <button
@@ -839,33 +881,40 @@ export function ResultView({
         </div>
       )}
 
-      {/* The volume cannot hold what is about to be pulled, so ask first */}
+      {/* The volume cannot hold what is about to be transferred, so ask first.
+          Above the transfer panel (z-110), which opens in the same gesture. */}
       {opener.pendingSpace && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+        <div className="fixed inset-0 z-[130] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
           <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 max-w-lg w-full shadow-2xl animate-fade-in-up">
-            <h3 className="text-lg font-bold text-zinc-100 mb-1">电脑磁盘放不下这一批</h3>
-            <p className="text-sm text-zinc-500 mb-4">
-              下载前查了一下目标文件夹所在的盘,剩余空间不够。硬拉会在中途失败并留下半个文件。
+            <h3 className="text-lg font-bold text-zinc-100 mb-1">
+              {opener.pendingSpace.scope}放不下这一批
+            </h3>
+            <p className="text-sm text-zinc-500 mb-4 leading-relaxed">
+              {opener.pendingSpace.scope === "电脑磁盘"
+                ? "传输前查了一下目标文件夹所在的盘,剩余空间不够。硬拉会在中途失败并留下半个文件。"
+                : "上传前查了一下手机的剩余空间。存储被写满时手机上的应用会立刻出问题,所以先停下来问一句。"}
             </p>
             <dl className="rounded-lg border border-zinc-800 bg-zinc-950 divide-y divide-zinc-800/70 text-sm mb-4">
               <div className="flex gap-3 px-3 py-2">
                 <dt className="w-24 shrink-0 text-zinc-600">需要</dt>
                 <dd className="text-zinc-200 font-mono">
                   {formatBytes(opener.pendingSpace.need)}
-                  <span className="text-zinc-600 text-xs ml-2">({opener.pendingSpace.nodes.length} 个文件)</span>
+                  <span className="text-zinc-600 text-xs ml-2">({opener.pendingSpace.items} 个文件)</span>
                 </dd>
               </div>
               <div className="flex gap-3 px-3 py-2">
-                <dt className="w-24 shrink-0 text-zinc-600">磁盘剩余</dt>
+                <dt className="w-24 shrink-0 text-zinc-600">{opener.pendingSpace.scope}剩余</dt>
                 <dd className="text-danger-400 font-mono">{formatBytes(opener.pendingSpace.free)}</dd>
               </div>
               <div className="flex gap-3 px-3 py-2">
-                <dt className="w-24 shrink-0 text-zinc-600">目标文件夹</dt>
-                <dd className="text-zinc-300 font-mono text-xs break-all">{opener.pendingSpace.kind === "download" ? "下载文件夹" : "缓存文件夹"}</dd>
+                <dt className="w-24 shrink-0 text-zinc-600">目标位置</dt>
+                <dd className="text-zinc-300 font-mono text-xs break-all">{opener.pendingSpace.where}</dd>
               </div>
             </dl>
             <p className="text-xs text-zinc-500 leading-relaxed mb-5">
-              可以先在「设置」里把{opener.pendingSpace.kind === "download" ? "下载" : "缓存"}位置换到空间更大的盘,或者少选几个文件。
+              {opener.pendingSpace.scope === "电脑磁盘"
+                ? "可以先在「设置」里把缓存/下载位置换到空间更大的盘,或者少选几个文件。"
+                : "可以先在手机上腾出空间,或者少选几个文件。"}
             </p>
             <div className="flex items-center gap-3 justify-end">
               <button onClick={opener.cancelSpace} className="px-4 py-2 rounded-lg text-sm font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 cursor-pointer">
@@ -896,6 +945,7 @@ export function ResultView({
         <DownloadsPanel
           queue={opener.queue}
           onOpenFolder={() => void callBackend("reveal_folder", { kind: "download" }).catch(() => undefined)}
+          onCancel={opener.cancelTransfer}
           onClear={opener.clearQueue}
           onClose={() => setDownloadsOpen(false)}
         />

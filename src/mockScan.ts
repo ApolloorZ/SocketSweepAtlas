@@ -138,6 +138,10 @@ export const MOCK_CAPACITY = {
   free_bytes: 20870692 * 1024,
 };
 
+// What a picked/dropped local file pretends to weigh. `?tight=1` puts the phone
+// under this, so the upload pre-check prompt is testable without a device.
+const MOCK_LOCAL_FILE_BYTES = 90 * 1024 * 1024;
+
 // Pretend the PC already holds copies in both folders so the settings page has
 // something to report and clearing it visibly changes the number.
 const mockDirs: Record<string, { files: number; bytes: number; path: string }> = {
@@ -189,8 +193,14 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
     case "push_file": {
       const source = String(args?.localPath ?? "file");
       const name = source.split(/[\\/]/).pop() || "file";
-      return wait(900).then(() => JSON.stringify({ remote: `/sdcard/Uploads/${name}`, name, bytes: 4096 }));
+      return wait(900).then(() => JSON.stringify({ remote: `/sdcard/Uploads/${name}`, name, bytes: MOCK_LOCAL_FILE_BYTES }));
     }
+    case "local_file_sizes": {
+      const list = (args?.paths as string[]) ?? [];
+      return Promise.resolve(JSON.stringify(list.map((path) => ({ path, bytes: MOCK_LOCAL_FILE_BYTES }))));
+    }
+    case "cancel_transfer":
+      return Promise.resolve('{"status":"cancelling"}');
     case "delete_item":
       return wait(700).then(() => JSON.stringify({ status: "ok", message: `Deleted 1 items at ${args?.path ?? "?"}` }));
     case "start_qr_pairing":
@@ -207,9 +217,15 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
           : { status: "connected", serial: "192.168.1.23:5555", pairing_endpoint: null }
       ));
     case "list_devices":
+      // One phone, both transports — what `list_devices` reports once they merge.
       return wait(300).then(() => JSON.stringify([
-        { serial: "982b7b0a", model: "M2012K11AC", kind: "usb", status: "device" },
-        { serial: "192.168.1.23:5555", model: "M2012K11AC", kind: "wireless", status: "device" },
+        {
+          serial: "982b7b0a",
+          model: "M2012K11AC",
+          kind: "usb",
+          status: "device",
+          transports: ["982b7b0a", "adb-982b7b0a-VV1VY._adb-tls-connect._tcp"],
+        },
       ]));
     case "pair_device":
       return wait(900).then(() => `Successfully paired to ${(args?.target ?? "")} [tcp]`);
@@ -217,8 +233,19 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
       return wait(700).then(() => `connected to ${args?.target ?? ""}`);
     case "disconnect_device":
       return wait(300).then(() => `disconnected ${args?.target ?? ""}`);
+    // `?tight=1` shrinks both volumes so the out-of-space prompt is testable.
     case "get_storage_info":
-      return wait(200).then(() => JSON.stringify(MOCK_CAPACITY));
+      return wait(200).then(() =>
+        JSON.stringify(
+          new URLSearchParams(window.location.search).has("tight")
+            ? {
+                ...MOCK_CAPACITY,
+                used_bytes: MOCK_CAPACITY.total_bytes - 64 * 1024 * 1024,
+                free_bytes: 64 * 1024 * 1024,
+              }
+            : MOCK_CAPACITY
+        )
+      );
     case "set_paths": {
       return wait(200).then(() => {
         const cache = typeof args?.cache === "string" ? args.cache : null;

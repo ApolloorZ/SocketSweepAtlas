@@ -7,6 +7,8 @@ interface DeviceInfo {
   model: string;
   kind: "usb" | "wireless";
   status: string;
+  /** Every transport adb sees for this one phone: cable, Wi-Fi, mDNS name. */
+  transports?: string[];
 }
 
 const STATUS_LABELS: Record<string, string> = {
@@ -290,13 +292,29 @@ export function DevicePanel({
         <div className="flex flex-col gap-2">
           {devices.map((d) => {
             const picked = target === d.serial;
+            // A phone on both the cable and Wi-Fi is one row; the wireless leg is
+            // the one worth being able to drop.
+            const wireless = (d.transports ?? (d.kind === "wireless" ? [d.serial] : [])).find(
+              (t) => t.includes(":") || t.includes("_adb-tls-")
+            );
+            const extra = (d.transports ?? []).length - 1;
             return (
               <div key={d.serial} className={`flex items-center gap-3 rounded-lg border px-3 py-2 ${picked ? "border-accent-500/50 bg-accent-500/10" : "border-zinc-800 bg-zinc-950"}`}>
                 <span className={`w-11 h-7 shrink-0 rounded-md border flex items-center justify-center text-[10px] font-mono ${d.kind === "usb" ? "border-accent-500/30 text-accent-400 bg-accent-500/10" : "border-sky-500/30 text-sky-400 bg-sky-500/10"}`}>
                   {d.kind === "usb" ? "USB" : "Wi-Fi"}
                 </span>
                 <div className="flex-1 min-w-0">
-                  <div className="text-sm text-zinc-200 truncate">{d.model || d.serial}</div>
+                  <div className="text-sm text-zinc-200 truncate flex items-center gap-2">
+                    <span>{d.model || d.serial}</span>
+                    {extra > 0 && (
+                      <span
+                        className="text-[10px] px-1.5 py-0.5 rounded border border-zinc-700 text-zinc-500 font-mono shrink-0"
+                        title={`同一台手机的 ${d.transports?.length} 条连接:\n${d.transports?.join("\n")}`}
+                      >
+                        {d.transports?.length} 条通道
+                      </span>
+                    )}
+                  </div>
                   <div className="text-[11px] text-zinc-600 font-mono truncate">{d.serial} · {d.kind === "usb" ? "USB 线" : "无线"}</div>
                 </div>
                 <StatusBadge status={d.status} />
@@ -310,12 +328,12 @@ export function DevicePanel({
                 >
                   {picked ? "用这台扫描" : "用这台"}
                 </button>
-                {d.kind === "wireless" && (
+                {wireless && (
                   <button
-                    onClick={() => run("已断开", () => callBackend("disconnect_device", { target: d.serial }))}
+                    onClick={() => run("已断开", () => callBackend("disconnect_device", { target: wireless }))}
                     className="px-2.5 py-1.5 rounded-md text-[11px] text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 cursor-pointer shrink-0"
                   >
-                    断开
+                    {d.kind === "wireless" ? "断开" : "断开无线"}
                   </button>
                 )}
               </div>
