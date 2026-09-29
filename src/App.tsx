@@ -662,18 +662,32 @@ function App() {
       setPhase("scanning");
       markStep("step.scan", "active");
       addLog("log.scanRequest", { root: SCAN_ROOT });
+      const requestAt = performance.now();
       const raw = await callBackend<string>("run_scan", { path: SCAN_ROOT });
       if (stale()) return;
+      // Where the wait goes: the round trip through Rust and adb, then the
+      // browser's own parse. The phone's share is in `scan_time_ms`.
+      const ipcMs = Math.round(performance.now() - requestAt);
       markStep("step.scan", "done");
 
       markStep("step.organise", "active");
       const parsed: ScanResponse = JSON.parse(raw);
+      const parseMs = Math.round(performance.now() - requestAt) - ipcMs;
       if (parsed.status !== "ok") throw new Error(`E#scan_status#${parsed.status || "?"}`);
       if (stale()) return;
       markStep("step.organise", "done");
 
       setScanData(parsed);
       setPhase("result");
+      requestAnimationFrame(() => {
+        addLog("log.scanTiming", {
+          ipc: ipcMs,
+          parse: parseMs,
+          frame: Math.round(performance.now() - requestAt),
+          phone: parsed.scan_time_ms,
+          size: (raw.length / 1048576).toFixed(1),
+        });
+      });
       addLog("log.scanDone", { files: formatNumber(parsed.total_files), ms: parsed.scan_time_ms });
     } catch (err: unknown) {
       if (stale()) return;

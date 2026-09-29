@@ -78,6 +78,7 @@ export const MESSAGES: Record<string, [zh: string, en: string]> = {
   "log.scanRequest": ["[SCAN] 请求扫描 {root} …", "[SCAN] Asking for a scan of {root}…"],
   "log.rescan": ["[SCAN] 重新扫描 {root} …", "[SCAN] Scanning {root} again…"],
   "log.scanDone": ["[SCAN] 完成:{files} 个文件,{ms}ms。", "[SCAN] Done: {files} files in {ms} ms."],
+  "log.scanTiming": ["[TIMING] 前端:往返 {ipc}ms · 解析 {parse}ms · 首屏 {frame}ms · 手机自己 {phone}ms · 响应 {size} MB", "[TIMING] front end: round trip {ipc}ms · parse {parse}ms · first frame {frame}ms · phone {phone}ms · payload {size} MB"],
   "log.cancelWait": ["[UI] 用户取消了等待。", "[UI] The user stopped waiting."],
   "log.moveStart": ["[MOVE] 正在移动 {count} 项到 {dest}…", "[MOVE] Moving {count} {p:item|items} into {dest}…"],
   "log.moveDone": ["[MOVE] 完成:成功 {ok} 项,失败 {failed} 项。", "[MOVE] Done: {ok} moved, {failed} refused."],

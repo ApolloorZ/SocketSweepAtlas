@@ -163,12 +163,30 @@ fn adb_s(adb_path: &std::path::Path, args: &[&str]) -> Result<String, String> {
 // ── TCP helper ──────────────────────────────────────────────────────────────
 
 /// Send a one-line command to the daemon and read the full response.
+/// Where the time actually goes on a scan. Only printed for large replies, so
+/// the PING and DELETE traffic stays quiet in the dev log.
+fn note_stage(bytes: usize, connect: Duration, sent: Duration, read: Duration, decoded: Duration) {
+    if bytes < 1024 * 1024 {
+        return;
+    }
+    println!(
+        "[TIMING] rust: 连接 {:.1}ms 发送 {:.1}ms 读取 {:.1}ms 转字符串 {:.1}ms · {} MB",
+        connect.as_secs_f64() * 1000.0,
+        sent.as_secs_f64() * 1000.0,
+        read.as_secs_f64() * 1000.0,
+        decoded.as_secs_f64() * 1000.0,
+        bytes / 1024 / 1024
+    );
+}
+
 fn daemon_command(cmd: &str) -> Result<String, String> {
+    let started = std::time::Instant::now();
     let mut stream = TcpStream::connect_timeout(
         &DAEMON_ADDR.parse().unwrap(),
         TCP_CONNECT_TIMEOUT,
     )
     .map_err(|e| format!("Cannot connect to daemon at {DAEMON_ADDR}: {e}"))?;
+    let connected = started.elapsed();
 
     stream
         .set_read_timeout(Some(TCP_READ_TIMEOUT))
@@ -182,13 +200,16 @@ fn daemon_command(cmd: &str) -> Result<String, String> {
     stream
         .write_all(payload.as_bytes())
         .map_err(|e| format!("Failed to send command to daemon: {e}"))?;
+    let sent = started.elapsed();
 
     let mut response_bytes = Vec::with_capacity(1024 * 1024);
     stream
         .read_to_end(&mut response_bytes)
         .map_err(|e| format!("Failed to read daemon response: {e}"))?;
+    let read = started.elapsed();
 
     let response = String::from_utf8_lossy(&response_bytes).trim().to_string();
+    note_stage(response_bytes.len(), connected, sent, read, started.elapsed());
     Ok(response)
 }
 
