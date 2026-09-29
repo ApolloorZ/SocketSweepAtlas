@@ -922,6 +922,7 @@ function App() {
               onUploaded={handleUploaded}
               flowError={flowError}
               onDismissError={() => setFlowError(null)}
+              settings={settings}
             />
           )}
         </div>

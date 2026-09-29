@@ -2,13 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { callBackend, isMockMode } from "./backend";
 import { Treemap, ResponsiveContainer, Tooltip as RechartsTooltip } from "recharts";
 import type { Capacity, FileNode, FlowError, ScanResponse } from "./types";
-import { CATEGORY_ORDER, categoryLabel, type Category } from "./categories";
+import { CATEGORY_ORDER, categoryLabel, categoryOf, type Category } from "./categories";
 import { breadcrumbs, clearStatsCache, collectCategories, findNode, subtreeStats } from "./tree";
 import { formatBytes, formatDate, formatNumber, percent } from "./format";
 import { TypeGlyph, TypeIcon } from "./icons";
+import { Thumb } from "./Thumb";
 import { DownloadsPanel } from "./DownloadsPanel";
 import { useFileOpener } from "./opener";
 import { say, useI18n, type Params } from "./i18n";
+import type { Settings } from "./settings";
 
 // ── Sorting ────────────────────────────────────────────────────────────────
 
@@ -181,6 +183,7 @@ export function ResultView({
   onUploaded,
   flowError,
   onDismissError,
+  settings,
 }: {
   data: ScanResponse;
   capacity: Capacity | null;
@@ -192,6 +195,7 @@ export function ResultView({
   onUploaded: (items: { name: string; bytes: number }[], dirPath: string) => void;
   flowError: FlowError | null;
   onDismissError: () => void;
+  settings: Settings;
 }) {
   const { t, lang } = useI18n();
   const [view, setView] = useState<View>("home");
@@ -456,6 +460,17 @@ export function ResultView({
 
   const selectedSize = useMemo(() => [...selected.values()].reduce((sum, n) => sum + n.size, 0), [selected]);
   const selectedFiles = useMemo(() => [...selected.values()].filter((n) => n.type === "file"), [selected]);
+
+  /**
+   * ES draws the share on the row itself: the tint stops where the share ends.
+   * A selected row keeps the accent fill instead, because which rows are ticked
+   * matters more in that moment than how big they are.
+   */
+  const rowTint = (node: FileNode) => {
+    if (!settings.rowShareBar || denominator <= 0 || node.size <= 0) return undefined;
+    const pct = Math.max(0.6, Math.min(100, (node.size / denominator) * 100));
+    return `linear-gradient(90deg, color-mix(in srgb, ${settings.rowShareColor} 16%, transparent) ${pct}%, transparent ${pct}%)`;
+  };
 
   const runDelete = async () => {
     const paths = [...selected.keys()];
@@ -756,9 +771,13 @@ export function ResultView({
                   onDoubleClick={() => !isDir && opener.openFile(node)}
                   title={t(isDir ? "row.dirHint" : "row.fileHint")}
                   className={`grid items-center gap-3 px-3 py-1.5 rounded-md file-row cursor-pointer ${checked ? "bg-accent-500/10" : ""} ${moving && checked ? "opacity-35" : ""}`}
-                  style={{ gridTemplateColumns: grid }}
+                  style={{ gridTemplateColumns: grid, background: rowTint(node) }}
                 >
-                  <TypeIcon node={node} />
+                  {settings.thumbnails && !isDir && categoryOf(node.name) === "image" ? (
+                    <Thumb node={node} fallback={<TypeIcon node={node} />} />
+                  ) : (
+                    <TypeIcon node={node} />
+                  )}
                   <div className="min-w-0">
                     <div className={`text-sm truncate flex items-center gap-2 ${isDir ? "text-zinc-200 font-medium" : "text-zinc-400"}`}>
                       <span className="truncate">{node.name}</span>
@@ -774,7 +793,8 @@ export function ResultView({
                   </div>
                   <div className="flex flex-col gap-1">
                     <span className="text-xs font-mono text-zinc-300">{formatBytes(node.size)}</span>
-                    <SizeBar ratio={node.size / (denominator || 1)} />
+                    {/* The row already carries the share when the tint is on. */}
+                    {!settings.rowShareBar && <SizeBar ratio={node.size / (denominator || 1)} />}
                   </div>
                   <span className="text-xs font-mono text-zinc-500">{percent(node.size, denominator)}</span>
                   {view === "browse"

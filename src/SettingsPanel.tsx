@@ -5,6 +5,12 @@ import { Panel } from "./Panel";
 import { MB, type Settings } from "./settings";
 import { Switch } from "./Switch";
 import { LANGUAGE_CHOICES, say, useI18n, type Lang, type Params } from "./i18n";
+import { CACHE_CHANGED } from "./opener";
+
+/** The list keeps its own picture of the cache folder; tell it to re-read. */
+function cacheChanged() {
+  window.dispatchEvent(new Event(CACHE_CHANGED));
+}
 
 interface DirStats {
   files: number;
@@ -190,6 +196,7 @@ export function SettingsPanel({
       onPatch({ [key]: value } as Partial<Settings>);
       setNotice({ key: value ? "set.pathChanged" : "set.pathReset" });
       await refresh();
+      cacheChanged();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -216,6 +223,38 @@ export function SettingsPanel({
             options={LANGUAGE_CHOICES}
             onChange={(lang) => onPatch({ lang })}
           />
+        </Row>
+        <Row title={t("set.shareBar")} note={t("set.shareBarNote")}>
+          <Switch
+            on={settings.rowShareBar}
+            onToggle={() => onPatch({ rowShareBar: !settings.rowShareBar })}
+            label={t("set.shareBar")}
+          />
+        </Row>
+        <Row title={t("set.thumbnails")} note={t("set.thumbnailsNote")}>
+          <Switch
+            on={settings.thumbnails}
+            onToggle={() => onPatch({ thumbnails: !settings.thumbnails })}
+            label={t("set.thumbnails")}
+          />
+        </Row>
+        <Row title={t("set.shareColor")} note={t("set.shareColorNote")}>
+          <label
+            className={`flex items-center gap-2 shrink-0 ${settings.rowShareBar ? "cursor-pointer" : "opacity-40"}`}
+            title={t("set.shareColor")}
+          >
+            <span className="text-[11px] font-mono text-zinc-500">{settings.rowShareColor}</span>
+            <span className="relative w-10 h-6 rounded-md border border-zinc-700" style={{ background: settings.rowShareColor }}>
+              <input
+                id="input-share-color"
+                type="color"
+                value={settings.rowShareColor}
+                disabled={!settings.rowShareBar}
+                onChange={(e) => onPatch({ rowShareColor: e.target.value })}
+                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer disabled:cursor-not-allowed"
+              />
+            </span>
+          </label>
         </Row>
       </Group>
 
@@ -245,7 +284,7 @@ export function SettingsPanel({
                 danger
                 onClick={() => {
                   setConfirmClear(false);
-                  void act("set.cleared", () => callBackend<string>("trim_cache", { limitBytes: 0, all: true }));
+                  void act("set.cleared", () => callBackend<string>("trim_cache", { limitBytes: 0, all: true })).then(cacheChanged);
                 }}
               >
                 {t("set.confirmClear")}
@@ -278,7 +317,7 @@ export function SettingsPanel({
               void act(
                 "set.trimmed",
                 () => callBackend<string>("trim_cache", { limitBytes: cacheLimitMb * MB, all: false })
-              );
+              ).then(cacheChanged);
             }}
           />
         </Row>

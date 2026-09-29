@@ -444,6 +444,54 @@ fn free_remote_name(adb_path: &std::path::Path, dir: &str, name: &str) -> Result
     }
 }
 
+/// base64 without pulling in a codec crate: this only ever encodes, and only
+/// from the byte head `peek_file` reads off the phone.
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        out.push(TABLE[(n >> 18 & 63) as usize] as char);
+        out.push(TABLE[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Reads the first `limit` bytes of a device file. A phone photo keeps a small
+/// preview inside its own header, so the interface can show a thumbnail without
+/// pulling the whole picture across adb.
+#[tauri::command(async)]
+fn peek_file(app: tauri::AppHandle, device_path: String, limit: u32) -> Result<String, String> {
+    if !device_path.starts_with("/sdcard") {
+        return Err(err("peek_outside_sdcard"));
+    }
+    let adb_path = get_bundled_binary(&app, "adb")?;
+    let blocks = (limit / 1024).clamp(1, 512);
+    let command = format!("dd if={} bs=1024 count={} 2>/dev/null", shell_quote(&device_path), blocks);
+
+    let mut args: Vec<String> = Vec::new();
+    if let Some(ref serial) = device_serial() {
+        args.push("-s".into());
+        args.push(serial.clone());
+    }
+    args.push("exec-out".into());
+    args.push(command);
+
+    let output = Command::new(&adb_path)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| err_arg("peek_failed", e))?;
+    if !output.status.success() && output.stdout.is_empty() {
+        return Err(err("peek_failed_empty"));
+    }
+    Ok(base64(&output.stdout))
+}
+
 /// Sizes of the files about to be uploaded. The front end adds them up and
 /// compares against the phone's free space before any byte is sent.
 #[tauri::command(async)]
@@ -1263,6 +1311,7 @@ pub fn run() {
             move_items,
             push_file,
             local_file_sizes,
+            peek_file,
             list_devices,
             pair_device,
             connect_device,

@@ -78,6 +78,9 @@ const lastName = (localPath: string) =>
  *  in src-tauri/src/lib.rs answers with the same code, so the two must match. */
 export const CANCELLED = "E#cancelled";
 
+/** Broadcast when the cache folder changed outside the file list. */
+export const CACHE_CHANGED = "ss-cache-changed";
+
 export function useFileOpener() {
   const [copies, setCopies] = useState<Map<string, CachedCopy>>(() => new Map());
   const [pull, setPull] = useState<PullState | null>(null);
@@ -103,6 +106,22 @@ export function useFileOpener() {
 
   useEffect(() => {
     refreshCache();
+  }, [refreshCache]);
+
+  /**
+   * The folder can change under us without anything here touching it: clearing
+   * the cache happens in the settings panel, and he can also delete copies in the
+   * file manager. Both would leave a 「已缓存」 badge on a file that is no longer
+   * on the PC, so the index is re-read when either happens.
+   */
+  useEffect(() => {
+    const redo = () => void refreshCache();
+    window.addEventListener(CACHE_CHANGED, redo);
+    window.addEventListener("focus", redo);
+    return () => {
+      window.removeEventListener(CACHE_CHANGED, redo);
+      window.removeEventListener("focus", redo);
+    };
   }, [refreshCache]);
 
   useEffect(() => {
