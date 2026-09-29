@@ -149,8 +149,22 @@ struct ScanStats {
 
 // ── JSON helpers ────────────────────────────────────────────────────────────
 static void json_escape_into(JsonStream& out, const std::string& s) {
-    for (unsigned char c : s) {
-        switch (c) {
+    // Ordinary bytes go out in whole runs. A 250k-file scan is tens of megabytes
+    // of ordinary bytes, and calling write() once per character dominated the
+    // entire scan on the phone's CPU. Output is byte for byte what the
+    // byte-at-a-time version produced.
+    const unsigned char* data = reinterpret_cast<const unsigned char*>(s.data());
+    const size_t n = s.size();
+    size_t i = 0;
+    while (i < n) {
+        size_t run = i;
+        while (run < n && data[run] >= 0x20 && data[run] != '"' && data[run] != '\\') run++;
+        if (run > i) {
+            out.write(reinterpret_cast<const char*>(data + i), run - i);
+            i = run;
+            continue;
+        }
+        switch (data[i]) {
             case '"':  out.write("\\\"", 2); break;
             case '\\': out.write("\\\\", 2); break;
             case '\b': out.write("\\b", 2); break;
@@ -158,17 +172,21 @@ static void json_escape_into(JsonStream& out, const std::string& s) {
             case '\n': out.write("\\n", 2); break;
             case '\r': out.write("\\r", 2); break;
             case '\t': out.write("\\t", 2); break;
-            default:
-                if (c < 0x20) {
-                    char buf[8];
-                    int len = std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                    out.write(buf, len);
-                } else {
-                    char b = static_cast<char>(c);
-                    out.write(&b, 1);
-                }
+            default: {
+                char buf[8];
+                int len = std::snprintf(buf, sizeof(buf), "\\u%04x", data[i]);
+                out.write(buf, len);
+            }
         }
+        i++;
     }
+}
+
+/// Numbers into a stack buffer; `std::to_string` allocated twice per node.
+static void write_number(JsonStream& out, int64_t value) {
+    char buf[24];
+    int len = std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value));
+    out.write(buf, static_cast<size_t>(len));
 }
 
 static void serialize_node(JsonStream& out, const FileNode& node) {
@@ -179,9 +197,9 @@ static void serialize_node(JsonStream& out, const FileNode& node) {
     out.write("\",\"type\":");
     out.write(node.is_dir ? "\"directory\"" : "\"file\"");
     out.write(",\"size\":");
-    out.write(std::to_string(node.size));
+    write_number(out, node.size);
     out.write(",\"mtime\":");
-    out.write(std::to_string(node.mtime));
+    write_number(out, node.mtime);
 
     if (node.is_dir) {
         out.write(",\"children\":[");
