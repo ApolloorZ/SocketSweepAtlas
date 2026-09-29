@@ -101,8 +101,36 @@ export function removeNode(
   return { root, removed: false, size: 0, files: 0, dirs: 0 };
 }
 
-export function breadcrumbs(root: FileNode, path: string): FileNode[] {
-  const parts: FileNode[] = [root];
+/**
+ * Inserts an uploaded file under `dirPath`, growing every ancestor's size the way
+ * removeNode shrinks them, so the numbers stay honest without another scan.
+ */
+export function addNode(
+  root: FileNode,
+  dirPath: string,
+  node: FileNode
+): { root: FileNode; added: boolean } {
+  if (root.path === dirPath) {
+    const children = [...(root.children ?? []), node];
+    return { root: { ...root, children, size: root.size + node.size }, added: true };
+  }
+  if (root.type !== "directory" || !root.children) return { root, added: false };
+
+  const children = root.children.slice();
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i];
+    if (child.type !== "directory") continue;
+    if (child.path !== dirPath && !dirPath.startsWith(child.path + "/")) continue;
+    const result = addNode(child, dirPath, node);
+    if (result.added) {
+      children[i] = result.root;
+      return { root: { ...root, children, size: root.size + node.size }, added: true };
+    }
+  }
+  return { root, added: false };
+}
+
+export function breadcrumbs(root: FileNode, path: string): FileNode[] {  const parts: FileNode[] = [root];
   let node: FileNode | null = root;
   while (node && node.path !== path) {
     const next: FileNode | undefined = (node.children ?? []).find(

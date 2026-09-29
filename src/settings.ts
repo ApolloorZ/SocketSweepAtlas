@@ -6,8 +6,6 @@ export interface Settings {
   theme: Theme;
   /** Show the developer log strip without the user opening it first. */
   logsOpen: boolean;
-  /** Pulling a file bigger than this asks for confirmation first. */
-  largeFileMb: number;
   /** Cached copies older than the rest get dropped once the folder passes this. */
   cacheLimitMb: number;
   /** null = the platform's application cache folder. */
@@ -22,7 +20,6 @@ export const MB = 1024 * 1024;
 export const DEFAULT_SETTINGS: Settings = {
   theme: "dark",
   logsOpen: false,
-  largeFileMb: 300,
   cacheLimitMb: 2048,
   cachePath: null,
   downloadPath: null,

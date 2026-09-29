@@ -178,20 +178,23 @@ export function SettingsPanel({
     }
   };
 
-  const chooseFolder = async (key: "cachePath" | "downloadPath", title: string, current: string | null) => {
-    const chosen = await pickFolder(title, current);
-    if (!chosen) return;
-    onPatch({ [key]: chosen } as Partial<Settings>);
-    await act("已改用新的位置。", () =>
-      callBackend<string>("set_paths", { [key === "cachePath" ? "cache" : "download"]: chosen })
-    );
+  /** The backend decides whether a folder is acceptable, so ask before storing. */
+  const applyPath = async (key: "cachePath" | "downloadPath", value: string | null) => {
+    setError(null);
+    setNotice(null);
+    try {
+      await callBackend<string>("set_paths", { [key === "cachePath" ? "cache" : "download"]: value ?? "" });
+      onPatch({ [key]: value } as Partial<Settings>);
+      setNotice(value ? "已改用新的位置。" : "已恢复默认位置。");
+      await refresh();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   };
 
-  const resetFolder = async (key: "cachePath" | "downloadPath") => {
-    onPatch({ [key]: null } as Partial<Settings>);
-    await act("已恢复默认位置。", () =>
-      callBackend<string>("set_paths", { [key === "cachePath" ? "cache" : "download"]: "" })
-    );
+  const chooseFolder = async (key: "cachePath" | "downloadPath", title: string, current: string | null) => {
+    const chosen = await pickFolder(title, current);
+    if (chosen) await applyPath(key, chosen);
   };
 
   return (
@@ -215,25 +218,12 @@ export function SettingsPanel({
       <Group title="缓存">
         <PathRow
           title="缓存位置"
-          note="双击打开的文件先落到这里;换位置不搬旧文件"
+          note="双击打开的文件先落到这里;必须是个空文件夹,里面的东西会被自动清理"
           path={cache?.path ?? null}
           custom={Boolean(settings.cachePath)}
           onPick={() => void chooseFolder("cachePath", "缓存", cache?.path ?? null)}
-          onReset={() => void resetFolder("cachePath")}
+          onReset={() => void applyPath("cachePath", null)}
         />
-
-        <Row title="大文件提醒" note="超过这个大小先问一句">
-          <Choice
-            value={settings.largeFileMb}
-            options={[
-              { value: 100, label: "100 MB" },
-              { value: 300, label: "300 MB" },
-              { value: 500, label: "500 MB" },
-              { value: 1024, label: "1 GB" },
-            ]}
-            onChange={(largeFileMb) => onPatch({ largeFileMb })}
-          />
-        </Row>
 
         <Row
           title={cache ? `${formatBytes(cache.bytes)} · ${cache.files} 个文件` : "正在统计…"}
@@ -303,7 +293,7 @@ export function SettingsPanel({
           path={downloads?.path ?? null}
           custom={Boolean(settings.downloadPath)}
           onPick={() => void chooseFolder("downloadPath", "下载", downloads?.path ?? null)}
-          onReset={() => void resetFolder("downloadPath")}
+          onReset={() => void applyPath("downloadPath", null)}
         />
 
         <Row

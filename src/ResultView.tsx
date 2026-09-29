@@ -1,11 +1,13 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { callBackend, isMockMode } from "./backend";
 import { Treemap, ResponsiveContainer, Tooltip as RechartsTooltip } from "recharts";
 import type { Capacity, FileNode, ScanResponse } from "./types";
 import { CATEGORY_LABELS, CATEGORY_ORDER, type Category } from "./categories";
 import { breadcrumbs, clearStatsCache, collectCategories, findNode, subtreeStats } from "./tree";
 import { formatBytes, formatDate, formatNumber, percent } from "./format";
 import { TypeGlyph, TypeIcon } from "./icons";
-import { estimatedSeconds, useFileOpener } from "./opener";
+import { DownloadsPanel } from "./DownloadsPanel";
+import { useFileOpener } from "./opener";
 
 // ── Sorting ────────────────────────────────────────────────────────────────
 
@@ -85,6 +87,83 @@ export function EmptyScanScreen({
   );
 }
 
+// ── Header actions ──────────────────────────────────────────────────────────
+
+function IconButton({
+  id,
+  label,
+  onClick,
+  danger,
+  children,
+}: {
+  id: string;
+  label: string;
+  onClick: () => void;
+  danger?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      id={id}
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+      className={`relative w-8 h-8 rounded-lg flex items-center justify-center border cursor-pointer shrink-0 ${
+        danger
+          ? "bg-zinc-800 text-zinc-400 border-zinc-700/50 hover:bg-red-950/50 hover:text-red-400"
+          : "bg-zinc-800 text-zinc-300 border-zinc-700/50 hover:bg-zinc-700 hover:text-zinc-100"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+const iconProps = {
+  width: 15,
+  height: 15,
+  viewBox: "0 0 16 16",
+  fill: "none",
+  stroke: "currentColor",
+  strokeWidth: 1.5,
+  strokeLinecap: "round",
+  strokeLinejoin: "round",
+} as const;
+
+const IconDownload = () => (
+  <svg {...iconProps}>
+    <path d="M8 2v7.5M5.2 7l2.8 2.8L10.8 7" />
+    <path d="M2.5 11.5v1a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-1" />
+  </svg>
+);
+
+const IconRescan = () => (
+  <svg {...iconProps}>
+    <path d="M13.5 8a5.5 5.5 0 1 1-1.85-4.08" />
+    <path d="M13.8 2.4v2.7h-2.7" />
+  </svg>
+);
+
+const IconDisconnect = () => (
+  <svg {...iconProps}>
+    <path d="M8 2v5" />
+    <path d="M4.7 4.3a5 5 0 1 0 6.6 0" />
+  </svg>
+);
+
+const IconBack = () => (
+  <svg {...iconProps} width={14} height={14}>
+    <path d="M9.5 3.5 5 8l4.5 4.5" />
+  </svg>
+);
+
+const IconUpload = () => (
+  <svg {...iconProps}>
+    <path d="M8 13.5V6m0 0L5.2 8.8M8 6l2.8 2.8" />
+    <path d="M2.5 4.5v-1a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v1" />
+  </svg>
+);
+
 // ── Main view ───────────────────────────────────────────────────────────────
 
 type View = "home" | "browse" | "category";
@@ -95,6 +174,7 @@ export function ResultView({
   onRescan,
   onDisconnect,
   onDeletePaths,
+  onUploaded,
   flowError,
   onDismissError,
 }: {
@@ -103,6 +183,7 @@ export function ResultView({
   onRescan: () => void;
   onDisconnect: () => void;
   onDeletePaths: (paths: string[]) => Promise<void>;
+  onUploaded: (items: { name: string; bytes: number }[], dirPath: string) => void;
   flowError: { message: string; hints: string[] } | null;
   onDismissError: () => void;
 }) {
@@ -114,21 +195,28 @@ export function ResultView({
   const [shown, setShown] = useState(300);
   const [selected, setSelected] = useState<Map<string, FileNode>>(new Map());
   const [confirming, setConfirming] = useState(false);
+  const [downloadsOpen, setDownloadsOpen] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const opener = useFileOpener();
+
+  // Where a dropped file should land. The native drag handler is registered once,
+  // so it reads the live target through a ref instead of closing over state.
+  const dropTarget = useRef<{ view: View; path: string }>({ view, path: browsePath });
+  dropTarget.current = { view, path: browsePath };
 
   useEffect(() => { clearStatsCache(); }, [data]);
   useEffect(() => { setShown(300); }, [view, browsePath, category, query, sort]);
 
   useEffect(() => {
-    if (!confirming && !opener.pendingLarge) return;
+    if (!confirming && !opener.pendingSpace) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       setConfirming(false);
-      opener.cancelLarge();
+      opener.cancelSpace();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [confirming, opener.pendingLarge]);
+  }, [confirming, opener.pendingSpace]);
 
   const buckets = useMemo(() => collectCategories(data.tree), [data]);
 
@@ -170,6 +258,65 @@ export function ResultView({
     setSort({ key: "size", desc: true });
     setSelected(new Map());
   }, []);
+
+  const parentPath = useMemo(() => {
+    const root = data.tree.path;
+    if (browsePath === root) return null;
+    const cut = browsePath.lastIndexOf("/");
+    return cut > 0 ? browsePath.slice(0, cut) : root;
+  }, [browsePath, data.tree.path]);
+
+  const runUpload = useCallback(
+    async (paths: string[]) => {
+      const dir = dropTarget.current.path;
+      setDownloadsOpen(true);
+      const ok = await opener.uploadFiles(paths, dir);
+      if (ok.length > 0) onUploaded(ok, dir);
+    },
+    [onUploaded, opener]
+  );
+
+  const pickUpload = useCallback(async () => {
+    if (isMockMode) {
+      await runUpload(["/mock/selected-from-computer.jpg"]);
+      return;
+    }
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const chosen = await open({ multiple: true, title: "选择要上传到手机的文件" });
+    const paths = Array.isArray(chosen) ? chosen : chosen ? [chosen] : [];
+    if (paths.length > 0) await runUpload(paths);
+  }, [runUpload]);
+
+  // Tauri owns drag and drop in the webview, so dropped paths arrive as a window
+  // event rather than a DOM one; the mock build has nothing to drop.
+  useEffect(() => {
+    if (isMockMode) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) =>
+        getCurrentWindow().onDragDropEvent((event) => {
+          const payload = event.payload;
+          if (payload.type === "enter" || payload.type === "over") {
+            setDragging(dropTarget.current.view === "browse");
+          } else if (payload.type === "leave") {
+            setDragging(false);
+          } else if (payload.type === "drop") {
+            setDragging(false);
+            if (dropTarget.current.view === "browse" && payload.paths.length > 0) void runUpload(payload.paths);
+          }
+        })
+      )
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [runUpload]);
 
   const toggleSelected = (node: FileNode) => {
     setSelected((prev) => {
@@ -238,27 +385,47 @@ export function ResultView({
           <span className="text-zinc-600 shrink-0 ml-auto">扫描到 {formatNumber(data.total_files)} 个文件 · {formatBytes(data.total_size)}</span>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
-          <button id="btn-rescan" onClick={onRescan} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 border border-zinc-700/50 cursor-pointer">
-            ↻ 重新扫描
-          </button>
-          <button id="btn-disconnect" onClick={onDisconnect} className="px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-400 hover:bg-red-950/50 hover:text-red-400 border border-zinc-700/50 cursor-pointer">
-            断开连接
-          </button>
+        <div className="flex items-center gap-1.5 shrink-0">
+          <IconButton id="btn-downloads" label="下载" onClick={() => setDownloadsOpen(true)}>
+            <IconDownload />
+            {opener.queue.some((item) => item.state === "active" || item.state === "queued") && (
+              <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full bg-accent-500 text-white text-[10px] font-mono flex items-center justify-center">
+                {opener.queue.filter((item) => item.state === "active" || item.state === "queued").length}
+              </span>
+            )}
+          </IconButton>
+          <IconButton id="btn-rescan" label="重新扫描" onClick={onRescan}>
+            <IconRescan />
+          </IconButton>
+          <IconButton id="btn-disconnect" label="断开连接" onClick={onDisconnect} danger>
+            <IconDisconnect />
+          </IconButton>
         </div>
       </header>
 
       {/* Path row — where you are right now */}
       {view === "browse" && (
-        <div className="px-5 py-2 border-b border-zinc-800/60 shrink-0 text-sm font-mono text-zinc-500 flex items-center min-w-0 overflow-x-auto">
-          {crumbs.map((c, i) => (
-            <span key={c.path} className="inline-flex items-center shrink-0">
-              <button onClick={() => openFolder(c.path)} className={`hover:text-zinc-300 cursor-pointer ${i === crumbs.length - 1 ? "text-zinc-100 font-semibold" : ""}`}>
-                {c.name}
-              </button>
-              {i < crumbs.length - 1 && <span className="mx-1.5 opacity-50">&gt;</span>}
-            </span>
-          ))}
+        <div className="px-5 py-2 border-b border-zinc-800/60 shrink-0 text-sm font-mono text-zinc-500 flex items-center gap-2 min-w-0">
+          <button
+            id="btn-up"
+            onClick={() => parentPath && openFolder(parentPath)}
+            disabled={!parentPath}
+            title={parentPath ? "返回上一级" : "已经在根目录"}
+            aria-label="返回上一级"
+            className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 border border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 disabled:opacity-35 disabled:cursor-not-allowed cursor-pointer"
+          >
+            <IconBack />
+          </button>
+          <div className="flex items-center min-w-0 overflow-x-auto">
+            {crumbs.map((c, i) => (
+              <span key={c.path} className="inline-flex items-center shrink-0">
+                <button onClick={() => openFolder(c.path)} className={`hover:text-zinc-300 cursor-pointer ${i === crumbs.length - 1 ? "text-zinc-100 font-semibold" : ""}`}>
+                  {c.name}
+                </button>
+                {i < crumbs.length - 1 && <span className="mx-1.5 opacity-50">&gt;</span>}
+              </span>
+            ))}
+          </div>
         </div>
       )}
       {view === "category" && (
@@ -410,6 +577,17 @@ export function ResultView({
                   取消选择
                 </button>
               )}
+              {view === "browse" && (
+                <button
+                  id="btn-upload"
+                  onClick={() => void pickUpload()}
+                  title={`上传文件到 ${browsePath}`}
+                  className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 border border-zinc-700/50 cursor-pointer shrink-0"
+                >
+                  <IconUpload />
+                  上传
+                </button>
+              )}
             </div>
 
             <div className="grid items-center gap-3 px-3 py-2 border-b border-zinc-800/80 sticky top-0 bg-surface-0/95 backdrop-blur" style={{ gridTemplateColumns: grid }}>
@@ -508,7 +686,13 @@ export function ResultView({
           )}
           <div className="ml-auto flex items-center gap-2">
             <button
-              onClick={() => opener.downloadFiles([...selected.values()])}
+              onClick={() => {
+                setDownloadsOpen(true);
+                void opener.downloadFiles([...selected.values()]);
+                // The queue now lives in the downloads panel, so the ticks have
+                // done their job and only get in the way.
+                setSelected(new Map());
+              }}
               disabled={selectedFiles.length === 0 || opener.downloading}
               title={selectedFiles.length === 0 ? "所选里没有可下载的文件(文件夹不能直接下载)" : "把所选文件拉到电脑的下载文件夹,保留原文件名,不自动打开"}
               className="px-4 py-2 rounded-lg text-sm font-semibold bg-zinc-800 text-accent-400 border border-accent-500/30 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
@@ -525,42 +709,66 @@ export function ResultView({
         </div>
       )}
 
-      {/* Big file: pull it to the PC first, so say how long that takes */}
-      {opener.pendingLarge && (
+      {/* The volume cannot hold what is about to be pulled, so ask first */}
+      {opener.pendingSpace && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
           <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 max-w-lg w-full shadow-2xl animate-fade-in-up">
-            <h3 className="text-lg font-bold text-zinc-100 mb-3">这个文件比较大,要先拉到电脑</h3>
-            <p className="text-sm text-zinc-400 break-all leading-relaxed mb-4">{opener.pendingLarge.name}</p>
+            <h3 className="text-lg font-bold text-zinc-100 mb-1">电脑磁盘放不下这一批</h3>
+            <p className="text-sm text-zinc-500 mb-4">
+              下载前查了一下目标文件夹所在的盘,剩余空间不够。硬拉会在中途失败并留下半个文件。
+            </p>
             <dl className="rounded-lg border border-zinc-800 bg-zinc-950 divide-y divide-zinc-800/70 text-sm mb-4">
               <div className="flex gap-3 px-3 py-2">
-                <dt className="w-24 shrink-0 text-zinc-600">文件大小</dt>
-                <dd className="text-zinc-200 font-mono">{formatBytes(opener.pendingLarge.size)}</dd>
+                <dt className="w-24 shrink-0 text-zinc-600">需要</dt>
+                <dd className="text-zinc-200 font-mono">
+                  {formatBytes(opener.pendingSpace.need)}
+                  <span className="text-zinc-600 text-xs ml-2">({opener.pendingSpace.nodes.length} 个文件)</span>
+                </dd>
               </div>
               <div className="flex gap-3 px-3 py-2">
-                <dt className="w-24 shrink-0 text-zinc-600">预计耗时</dt>
-                <dd className="text-accent-400 font-mono">约 {estimatedSeconds(opener.pendingLarge.size)} 秒(USB 实测约 38 MB/s)</dd>
+                <dt className="w-24 shrink-0 text-zinc-600">磁盘剩余</dt>
+                <dd className="text-danger-400 font-mono">{formatBytes(opener.pendingSpace.free)}</dd>
               </div>
               <div className="flex gap-3 px-3 py-2">
-                <dt className="w-24 shrink-0 text-zinc-600">位置</dt>
-                <dd className="text-zinc-300 font-mono text-xs break-all">{opener.pendingLarge.path}</dd>
+                <dt className="w-24 shrink-0 text-zinc-600">目标文件夹</dt>
+                <dd className="text-zinc-300 font-mono text-xs break-all">{opener.pendingSpace.kind === "download" ? "下载文件夹" : "缓存文件夹"}</dd>
               </div>
             </dl>
             <p className="text-xs text-zinc-500 leading-relaxed mb-5">
-              拉过来后会存在电脑缓存里,下次双击秒开。视频其实直接在手机上看更快。
+              可以先在「设置」里把{opener.pendingSpace.kind === "download" ? "下载" : "缓存"}位置换到空间更大的盘,或者少选几个文件。
             </p>
             <div className="flex items-center gap-3 justify-end">
-              <button onClick={opener.cancelLarge} className="px-4 py-2 rounded-lg text-sm font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 cursor-pointer">
+              <button onClick={opener.cancelSpace} className="px-4 py-2 rounded-lg text-sm font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 cursor-pointer">
                 取消 (Esc)
               </button>
               <button
-                onClick={() => opener.confirmLarge(opener.pendingLarge!)}
-                className="px-4 py-2 rounded-lg text-sm font-bold bg-gradient-to-r from-accent-600 to-accent-500 text-white hover:from-accent-500 hover:to-accent-400 cursor-pointer"
+                onClick={opener.confirmSpace}
+                className="px-4 py-2 rounded-lg text-sm font-semibold bg-zinc-800 text-zinc-200 border border-zinc-700 hover:bg-zinc-700 cursor-pointer"
               >
-                拉取并打开
+                仍然尝试
               </button>
             </div>
           </div>
         </div>
+      )}
+
+      {dragging && (
+        <div className="pointer-events-none fixed inset-0 z-[95] flex items-center justify-center bg-black/55 backdrop-blur-[2px]">
+          <div className="rounded-2xl border-2 border-dashed border-accent-500/70 bg-zinc-900/95 px-8 py-6 text-center shadow-2xl">
+            <p className="text-sm font-semibold text-zinc-100">松手即上传到当前目录</p>
+            <p className="mt-1.5 text-xs text-zinc-400 font-mono break-all max-w-md">{browsePath}</p>
+            <p className="mt-2 text-[11px] text-zinc-600">同名文件不会被覆盖,会自动加 (2)、(3)</p>
+          </div>
+        </div>
+      )}
+
+      {downloadsOpen && (
+        <DownloadsPanel
+          queue={opener.queue}
+          onOpenFolder={() => void callBackend("reveal_folder", { kind: "download" }).catch(() => undefined)}
+          onClear={opener.clearQueue}
+          onClose={() => setDownloadsOpen(false)}
+        />
       )}
 
       {/* Confirm dialog */}

@@ -175,9 +175,13 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
         }
         return JSON.stringify(mockScanResponse());
       });
-    case "delete_item": {
-      return wait(700).then(() => JSON.stringify({ status: "ok", message: `Deleted 1 items at ${args?.path ?? "?"}` }));
+    case "push_file": {
+      const source = String(args?.localPath ?? "file");
+      const name = source.split(/[\\/]/).pop() || "file";
+      return wait(900).then(() => JSON.stringify({ remote: `/sdcard/Uploads/${name}`, name, bytes: 4096 }));
     }
+    case "delete_item":
+      return wait(700).then(() => JSON.stringify({ status: "ok", message: `Deleted 1 items at ${args?.path ?? "?"}` }));
     case "start_qr_pairing":
       return wait(400).then(() => JSON.stringify({
         svg: MOCK_QR_SVG,
@@ -223,6 +227,30 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
       const dir = mockDirs[String(args?.kind ?? "cache")] ?? mockDirs.cache;
       return wait(200).then(() => JSON.stringify(dir));
     }
+    case "dir_list": {
+      const dir = mockDirs[String(args?.kind ?? "cache")] ?? mockDirs.cache;
+      return wait(250).then(() =>
+        JSON.stringify(
+          Array.from({ length: dir.files }, (_, i) => ({
+            name: `mock-file-${i + 1}.bin`,
+            bytes: Math.round(dir.bytes / Math.max(1, dir.files)),
+            mtime: Math.floor(Date.now() / 1000) - i * 3600,
+            path: `${dir.path}\\mock-file-${i + 1}.bin`,
+          }))
+        )
+      );
+    }
+    // `?tight=1` makes the volume look smaller than the batch to exercise the
+    // out-of-space dialog.
+    case "disk_free":
+      return wait(200).then(() =>
+        JSON.stringify({
+          path: mockDirs[String(args?.kind ?? "download") as string]?.path ?? mockDirs.download.path,
+          free: new URLSearchParams(window.location.search).has("tight") ? 64 * 1024 * 1024 : 40 * 1024 * 1024 * 1024,
+        })
+      );
+    case "cached_entries":
+      return wait(200).then(() => JSON.stringify([]));
     case "reveal_folder":
       return wait(200).then(() => mockDirs[String(args?.kind ?? "cache")]?.path ?? mockDirs.cache.path);
     case "trim_cache": {

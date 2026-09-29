@@ -133,13 +133,16 @@ pub(crate) fn adb(adb_path: &std::path::Path, args: &[&str]) -> Result<String, S
 
 /// Run an ADB command targeting the stored device serial (if any).
 /// Prepends `-s <serial>` when a device serial is known.
+/// The transport the current session is talking to, when one was chosen.
+fn device_serial() -> Option<String> {
+    DEVICE_SERIAL.lock().ok().and_then(|guard| guard.clone())
+}
+
 fn adb_s(adb_path: &std::path::Path, args: &[&str]) -> Result<String, String> {
-    if let Ok(guard) = DEVICE_SERIAL.lock() {
-        if let Some(ref serial) = *guard {
-            let mut full_args = vec!["-s", serial.as_str()];
-            full_args.extend_from_slice(args);
-            return adb(adb_path, &full_args);
-        }
+    if let Some(serial) = device_serial() {
+        let mut full_args = vec!["-s", serial.as_str()];
+        full_args.extend_from_slice(args);
+        return adb(adb_path, &full_args);
     }
     adb(adb_path, args)
 }
@@ -371,6 +374,117 @@ fn delete_item(path: String) -> Result<String, String> {
     daemon_command(&format!("DELETE {path}"))
 }
 
+/// Quotes nothing and trusts nothing: a file name straight off someone's disk
+/// ends up inside a shell string on the device, so the shell metacharacters go.
+fn safe_remote_name(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '\'' | '"' | '$' | '`' | ';' | '|' | '&' | '\\' | '<' | '>' | '?' | '*' | ':' | '\n' | '\r' => '_',
+            other => other,
+        })
+        .collect()
+}
+
+fn device_shell(adb_path: &std::path::Path, script: String) -> Result<String, String> {
+    let serial = device_serial();
+    let mut args: Vec<&str> = Vec::new();
+    if let Some(ref serial) = serial {
+        args.push("-s");
+        args.push(serial.as_str());
+    }
+    args.push("shell");
+    args.push(script.as_str());
+    adb(adb_path, &args)
+}
+
+/// The first name in `device_dir` that does not already exist on the phone.
+/// Overwriting a file the user never asked us to touch is not on the table.
+fn free_remote_name(adb_path: &std::path::Path, dir: &str, name: &str) -> Result<String, String> {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((head, tail)) if !head.is_empty() => (head.to_string(), Some(tail.to_string())),
+        _ => (name.to_string(), None),
+    };
+    let mut index = 1;
+    loop {
+        let candidate = match (&stem, &ext) {
+            (s, Some(e)) if index == 1 => format!("{s}.{e}"),
+            (s, Some(e)) => format!("{s} ({index}).{e}"),
+            (s, None) if index == 1 => s.clone(),
+            (s, None) => format!("{s} ({index})"),
+        };
+        let probe = format!("test -e '{dir}/{candidate}' && echo TAKEN || echo FREE");
+        let answer = device_shell(adb_path, probe).unwrap_or_else(|_| "FREE".into());
+        if answer.contains("FREE") {
+            return Ok(candidate);
+        }
+        index += 1;
+        if index > 50 {
+            return Err("同名文件太多,没能找到可用的文件名。".into());
+        }
+    }
+}
+
+/// Copies a local file into a folder on the phone and reports progress.
+#[tauri::command(async)]
+fn push_file(app: tauri::AppHandle, local_path: String, device_dir: String) -> Result<String, String> {
+    let adb_path = get_bundled_binary(&app, "adb")?;
+    if !device_dir.starts_with("/sdcard") {
+        return Err("只能上传到手机 /sdcard 下的目录。".into());
+    }
+    let source = std::path::PathBuf::from(&local_path);
+    let meta = std::fs::metadata(&source).map_err(|e| format!("读不到这个文件:{e}"))?;
+    if !meta.is_file() {
+        return Err("只能上传单个文件,文件夹请先打包。".into());
+    }
+    let size = meta.len() as i64;
+    let dir = device_dir.trim_end_matches('/');
+    let raw = source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "文件名无法识别。".to_string())?;
+    let target = free_remote_name(&adb_path, dir, &safe_remote_name(raw))?;
+    let remote = format!("{dir}/{target}");
+
+    let serial = device_serial();
+    let mut args: Vec<String> = Vec::new();
+    if let Some(ref serial) = serial {
+        args.push("-s".into());
+        args.push(serial.clone());
+    }
+    args.push("push".into());
+    args.push(local_path.clone());
+    args.push(remote.clone());
+
+    let mut child = Command::new(&adb_path)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("上传没能启动:{e}"))?;
+
+    while let Ok(None) = child.try_wait() {
+        let probe = format!("stat -c %s '{remote}' 2>/dev/null");
+        let done = device_shell(&adb_path, probe)
+            .ok()
+            .and_then(|text| text.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        let _ = app.emit(
+            "push-progress",
+            serde_json::json!({ "path": local_path, "done": done, "total": size }),
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("上传没能结束:{e}"))?;
+    if !status.success() {
+        return Err(format!("上传失败:{raw}"));
+    }
+
+    Ok(serde_json::json!({ "remote": remote, "name": target, "bytes": size }).to_string())
+}
+
 // ── Device management (USB + wireless adb) ──────────────────────────────────
 
 #[derive(serde::Serialize)]
@@ -515,15 +629,44 @@ fn describe_paths(app: &tauri::AppHandle) -> Result<Paths, String> {
     })
 }
 
-fn pick(slot: &Mutex<Option<std::path::PathBuf>>, value: Option<String>, label: &str) -> Result<(), String> {
+/// Every file inside the cache folder belongs to us, because configuring a
+/// folder that already holds files is refused — see `pick`.
+fn cache_dir_has_foreign_files(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| entries.flatten().any(|entry| entry.path().is_file()))
+        .unwrap_or(false)
+}
+
+fn pick(
+    slot: &Mutex<Option<std::path::PathBuf>>,
+    value: Option<String>,
+    label: &str,
+    must_be_empty: bool,
+) -> Result<(), String> {
     let Some(value) = value else { return Ok(()) };
     let trimmed = value.trim();
     if trimmed.is_empty() {
         *slot.lock().map_err(|_| format!("{label}设置无法保存"))? = None;
         return Ok(());
     }
-    ensure_dir(std::path::PathBuf::from(trimmed), label)?;
-    *slot.lock().map_err(|_| format!("{label}设置无法保存"))? = Some(std::path::PathBuf::from(trimmed));
+    // The folder gets swept by the cap and by clear-on-exit, so refuse the places
+    // where that would be a catastrophe and refuse folders holding other things.
+    let candidate = std::path::PathBuf::from(trimmed);
+    if candidate.parent().is_none() {
+        return Err(format!("不能把盘符根目录当{label}位置,请在里面新建一个子文件夹。"));
+    }
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    if !home.as_os_str().is_empty() && candidate == home {
+        return Err(format!("不能把用户主目录当{label}位置,请在里面选一个子文件夹。"));
+    }
+    ensure_dir(candidate.clone(), label)?;
+    if must_be_empty && cache_dir_has_foreign_files(&candidate) {
+        return Err(format!("{label}位置必须是空文件夹:里面的文件会被自动清理,请新建一个或先清空。"));
+    }
+    *slot.lock().map_err(|_| format!("{label}设置无法保存"))? = Some(candidate);
     Ok(())
 }
 
@@ -536,8 +679,8 @@ fn set_paths(
     download: Option<String>,
     clear_on_exit: Option<bool>,
 ) -> Result<String, String> {
-    pick(&CACHE_PATH, cache, "缓存")?;
-    pick(&DOWNLOAD_PATH, download, "下载")?;
+    pick(&CACHE_PATH, cache, "缓存", true)?;
+    pick(&DOWNLOAD_PATH, download, "下载", false)?;
     if let Some(flag) = clear_on_exit {
         CLEAR_CACHE_ON_EXIT.store(flag, Ordering::Relaxed);
     }
@@ -570,10 +713,22 @@ fn dir_stats(app: tauri::AppHandle, kind: String) -> Result<String, String> {
     Ok(serde_json::json!({ "files": files, "bytes": bytes, "path": dir.to_string_lossy() }).to_string())
 }
 
-/// Flattens a device path into a single safe file name, e.g.
-/// `/sdcard/DCIM/a.jpg` → `sdcard_DCIM_a.jpg`.
+/// FNV-1a over the device path, mixed into the cached file name. Flattening
+/// alone is lossy — `/sdcard/a/b.jpg` and `/sdcard/a_b.jpg` both become
+/// `sdcard_a_b.jpg` — and a collision silently opens the wrong copy. The front
+/// end recomputes the same value, so both sides must agree exactly.
+fn fnv1a32(text: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// `/sdcard/DCIM/a.jpg` → `sdcard_DCIM_a-3f2a1b9c.jpg`.
 fn cached_file_name(device_path: &str) -> String {
-    device_path
+    let flat: String = device_path
         .trim_start_matches('/')
         .replace('/', "_")
         .chars()
@@ -581,51 +736,96 @@ fn cached_file_name(device_path: &str) -> String {
             ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
             other => other,
         })
-        .collect()
-}
-
-#[tauri::command(async)]
-fn cached_files(app: tauri::AppHandle) -> Result<Vec<String>, String> {
-    let dir = cache_dir(&app)?;
-    let mut names = Vec::new();
-    let entries = std::fs::read_dir(&dir).map_err(|e| format!("Failed to read the cache folder: {e}"))?;
-    for entry in entries.flatten() {
-        if entry.path().is_file() {
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
-        }
+        .collect();
+    let tag = format!("-{:08x}", fnv1a32(device_path));
+    match flat.rfind('.') {
+        Some(dot) if dot > 0 && dot + 1 < flat.len() => format!("{}{}{}", &flat[..dot], tag, &flat[dot..]),
+        _ => format!("{flat}{tag}"),
     }
-    Ok(names)
 }
 
-fn cache_files(app: &tauri::AppHandle) -> Result<Vec<(std::path::PathBuf, u64, std::time::SystemTime)>, String> {
-    let dir = cache_dir(app)?;
+#[derive(serde::Serialize)]
+struct CachedEntry {
+    name: String,
+    bytes: u64,
+    mtime: i64,
+}
+
+/// What the cache folder holds, so the front end can mark a row 已缓存 only when
+/// the copy really matches the file on the phone.
+#[tauri::command(async)]
+fn cached_entries(app: tauri::AppHandle) -> Result<String, String> {
     let mut out = Vec::new();
-    let entries = std::fs::read_dir(&dir).map_err(|e| format!("读取缓存目录失败:{e}"))?;
+    for (path, len, mtime) in dir_entries(&cache_dir(&app)?) {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        out.push(CachedEntry { name: name.to_string(), bytes: len, mtime });
+    }
+    serde_json::to_string(&out).map_err(|e| e.to_string())
+}
+
+fn epoch_secs(at: std::time::SystemTime) -> i64 {
+    at.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Files directly inside a folder, newest first, with their size and mtime.
+fn dir_entries(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u64, i64)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(meta) = entry.metadata() else { continue };
-        if meta.is_file() {
-            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-            out.push((path, meta.len(), mtime));
+        if !meta.is_file() {
+            continue;
         }
+        let mtime = epoch_secs(meta.modified().unwrap_or(std::time::UNIX_EPOCH));
+        out.push((path, meta.len(), mtime));
     }
-    Ok(out)
+    out.sort_by(|a, b| b.2.cmp(&a.2));
+    out
+}
+
+#[derive(serde::Serialize)]
+struct Listed {
+    name: String,
+    bytes: u64,
+    mtime: i64,
+    path: String,
+}
+
+/// The contents of the cache or download folder, newest first, for the downloads
+/// panel. Capped because the folder is the user's to keep filling.
+#[tauri::command(async)]
+fn dir_list(app: tauri::AppHandle, kind: String) -> Result<String, String> {
+    let entries: Vec<Listed> = dir_entries(&dir_for(&app, &kind)?)
+        .into_iter()
+        .filter_map(|(path, bytes, mtime)| {
+            Some(Listed {
+                name: path.file_name()?.to_str()?.to_string(),
+                bytes,
+                mtime,
+                path: path.to_string_lossy().into_owned(),
+            })
+        })
+        .take(200)
+        .collect();
+    serde_json::to_string(&entries).map_err(|e| e.to_string())
 }
 
 /// Deletes cached copies, oldest first, until the folder fits under
-/// `limit_bytes`; `all` empties it regardless.
-#[tauri::command(async)]
-fn trim_cache(app: tauri::AppHandle, limit_bytes: i64, all: bool) -> Result<String, String> {
-    let mut files = cache_files(&app)?;
-    files.sort_by(|a, b| a.2.cmp(&b.2));
-    let mut total: u64 = files.iter().map(|(_, len, _)| *len).sum();
+/// `limit_bytes`; `all` empties it. Safe to sweep because a folder holding other
+/// files can never be chosen as the cache location.
+fn clear_cache(app: &tauri::AppHandle, limit_bytes: i64, all: bool) -> Result<(u64, u64, u64), String> {
+    let mut ours = dir_entries(&cache_dir(app)?);
+    ours.sort_by_key(|(_, _, mtime)| *mtime);
+
+    let mut total: u64 = ours.iter().map(|(_, len, _)| *len).sum();
     let limit = limit_bytes.max(0) as u64;
     let mut removed = 0u64;
     let mut freed = 0u64;
 
-    for (path, len, _) in files {
+    for (path, len, _) in ours {
         if !all && total <= limit {
             break;
         }
@@ -635,8 +835,48 @@ fn trim_cache(app: tauri::AppHandle, limit_bytes: i64, all: bool) -> Result<Stri
             freed += len;
         }
     }
+    Ok((removed, freed, total))
+}
 
-    Ok(serde_json::json!({ "removed": removed, "freed": freed, "bytes": total }).to_string())
+#[tauri::command(async)]
+fn trim_cache(app: tauri::AppHandle, limit_bytes: i64, all: bool) -> Result<String, String> {
+    let (removed, freed, bytes) = clear_cache(&app, limit_bytes, all)?;
+    Ok(serde_json::json!({ "removed": removed, "freed": freed, "bytes": bytes }).to_string())
+}
+
+/// Free bytes on the volume holding one of our folders. Checked before a pull
+/// because an `adb pull` that runs out of disk fails halfway and leaves a
+/// truncated file behind.
+#[cfg(windows)]
+fn volume_free(path: &std::path::Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let (mut available, mut total, mut total_free) = (0u64, 0u64, 0u64);
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            &mut total,
+            &mut total_free,
+        )
+    };
+    (ok != 0).then_some(available)
+}
+
+#[cfg(not(windows))]
+fn volume_free(path: &std::path::Path) -> Option<u64> {
+    let out = Command::new("df").args(["-kP", &path.to_string_lossy()]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let avail = text.lines().last()?.split_whitespace().nth(3)?.parse::<u64>().ok()?;
+    Some(avail * 1024)
+}
+
+#[tauri::command(async)]
+fn disk_free(app: tauri::AppHandle, kind: String) -> Result<String, String> {
+    let dir = dir_for(&app, &kind)?;
+    let free = volume_free(&dir).ok_or_else(|| format!("读不到 {} 所在磁盘的剩余空间", dir.display()))?;
+    Ok(serde_json::json!({ "path": dir.to_string_lossy(), "free": free }).to_string())
 }
 
 /// Picks a name inside the download folder: reuses a byte-identical copy that is
@@ -682,13 +922,15 @@ fn pull_file(
     app: tauri::AppHandle,
     device_path: String,
     size: i64,
+    mtime: i64,
     open: bool,
     kind: Option<String>,
 ) -> Result<String, String> {
     use tauri_plugin_opener::OpenerExt;
 
     let adb_path = get_bundled_binary(&app, "adb")?;
-    let local = if kind.as_deref() == Some("download") {
+    let to_download = kind.as_deref() == Some("download");
+    let local = if to_download {
         download_target(&download_dir(&app)?, &device_path, size)
     } else {
         cache_dir(&app)?.join(cached_file_name(&device_path))
@@ -698,14 +940,33 @@ fn pull_file(
         .ok_or_else(|| format!("Local path is not valid text: {:?}", local))?
         .to_string();
 
-    let already_cached = size > 0
-        && local.is_file()
-        && local.metadata().map(|m| m.len() as i64).unwrap_or(0) == size;
+    // A copy is only reusable when it matches both the size and the phone's own
+    // modification time; size alone would serve a stale file forever.
+    let already_there = size > 0
+        && local
+            .metadata()
+            .map(|meta| {
+                meta.len() as i64 == size
+                    && (mtime <= 0
+                        || epoch_secs(meta.modified().unwrap_or(std::time::UNIX_EPOCH)) == mtime)
+            })
+            .unwrap_or(false);
 
-    if !already_cached {
+    if !already_there {
         let _ = std::fs::remove_file(&local);
+        // Always name the transport: a phone that is paired over Wi-Fi *and*
+        // plugged in shows up twice, and a bare `adb pull` then fails with
+        // "more than one device/emulator".
+        let serial = device_serial();
+        let mut args: Vec<&str> = Vec::new();
+        if let Some(ref serial) = serial {
+            args.push("-s");
+            args.push(serial.as_str());
+        }
+        args.extend(["pull", device_path.as_str(), local_str.as_str()]);
+
         let mut child = Command::new(&adb_path)
-            .args(["pull", &device_path, &local_str])
+            .args(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -726,6 +987,14 @@ fn pull_file(
         if !status.success() {
             let _ = std::fs::remove_file(&local);
             return Err(format!("adb pull failed for {device_path}"));
+        }
+
+        // Give the copy the phone's timestamp so the next comparison means something.
+        if mtime > 0 {
+            if let Ok(handle) = std::fs::OpenOptions::new().write(true).open(&local) {
+                let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime as u64);
+                let _ = handle.set_modified(when);
+            }
         }
     }
 
@@ -796,6 +1065,7 @@ pub fn run() {
             ping_daemon,
             stop_daemon,
             delete_item,
+            push_file,
             list_devices,
             pair_device,
             connect_device,
@@ -805,7 +1075,9 @@ pub fn run() {
             wireless_auto_connect,
             set_paths,
             dir_stats,
-            cached_files,
+            dir_list,
+            disk_free,
+            cached_entries,
             trim_cache,
             pull_file,
             reveal_folder,
@@ -816,11 +1088,7 @@ pub fn run() {
             // Emptying the cache on exit only happens because the settings page
             // asked for it; downloads are never touched here.
             if matches!(event, tauri::RunEvent::Exit) && CLEAR_CACHE_ON_EXIT.load(Ordering::Relaxed) {
-                if let Ok(files) = cache_files(app) {
-                    for (path, _, _) in files {
-                        let _ = std::fs::remove_file(path);
-                    }
-                }
+                let _ = clear_cache(app, 0, true);
             }
         });
 }

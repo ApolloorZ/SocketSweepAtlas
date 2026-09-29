@@ -4,7 +4,7 @@ import { EmptyScanScreen, ResultView } from "./ResultView";
 import { DevicePanel } from "./DevicePanel";
 import { SettingsPanel } from "./SettingsPanel";
 import { useSettings } from "./settings";
-import { removeNode } from "./tree";
+import { addNode, removeNode } from "./tree";
 import { formatBytes, formatNumber } from "./format";
 import type { AppPhase, Capacity, ScanResponse, Toast } from "./types";
 import "./App.css";
@@ -679,6 +679,41 @@ function App() {
     setPhase(scanData ? "result" : "setup");
   }, [addLog, pushToast, scanData, mode]);
 
+  // An upload changes the phone, so the tree has to change with it: insert the
+  // file and grow every ancestor, otherwise the numbers shown are a lie.
+  const handleUploaded = useCallback((items: { name: string; bytes: number }[], dirPath: string) => {
+    const base = scanDataRef.current;
+    if (!base) return;
+    const dir = dirPath.replace(/\/+$/, "");
+    const now = Math.floor(Date.now() / 1000);
+    let tree = base.tree;
+    let added = 0;
+    let bytes = 0;
+
+    for (const item of items) {
+      const result = addNode(tree, dir, {
+        name: item.name,
+        path: `${dir}/${item.name}`,
+        type: "file",
+        size: item.bytes,
+        mtime: now,
+      });
+      if (!result.added) continue;
+      tree = result.root;
+      added += 1;
+      bytes += item.bytes;
+    }
+    if (added === 0) return;
+
+    setScanData({
+      ...base,
+      tree,
+      total_files: base.total_files + added,
+      total_size: base.total_size + bytes,
+    });
+    pushToast(`已上传 ${added} 个文件,共 ${formatBytes(bytes)}`, "success");
+  }, [pushToast]);
+
   const handleDisconnect = useCallback(async () => {
     runIdRef.current++;
     addLog("[SOCKET] 断开扫描程序…");
@@ -744,6 +779,16 @@ function App() {
 
     const okCount = paths.length - failed.length;
     if (okCount > 0) pushToast(`已删除 ${okCount} 项,释放 ${formatBytes(freed)}`, "success");
+
+    // The capacity strip came from `df` at connect time; after freeing gigabytes
+    // it has to be asked again or it keeps showing the old numbers.
+    if (freed > 0) {
+      try {
+        setCapacity(JSON.parse(await callBackend<string>("get_storage_info")) as Capacity);
+      } catch (err: unknown) {
+        addLog(`[CAPACITY] ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     if (failed.length > 0) {
       setFlowError({
         message: `${failed.length} 项删除失败:${failed.slice(0, 3).join("、")}${failed.length > 3 ? " …" : ""}`,
@@ -802,6 +847,7 @@ function App() {
             onRescan={handleRescan}
             onDisconnect={handleDisconnect}
             onDeletePaths={handleDeletePaths}
+            onUploaded={handleUploaded}
             flowError={flowError}
             onDismissError={() => setFlowError(null)}
           />

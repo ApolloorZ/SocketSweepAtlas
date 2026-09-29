@@ -21,6 +21,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to hold out for the instance name from the QR before trusting a
 /// single pairing service on the network.
 const SOLO_FALLBACK: Duration = Duration::from_secs(12);
+/// How long to let adb connect the phone itself before we start dialling ports;
+/// dialling too early leaves two transports for one phone.
+const AUTO_CONNECT_GRACE: Duration = Duration::from_secs(4);
 /// How long the hands-off LAN search runs before we ask the user to intervene.
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -225,9 +228,10 @@ fn dial(adb_path: &std::path::Path, target: &str) -> bool {
 
 /// Turns a finished pairing into a live connection.
 ///
-/// Right after `adb pair` succeeds adb usually connects the device on its own and
-/// drops the `_adb-tls-connect` advertisement it had published, so watching for a
-/// new transport comes first; dialling the advertised port is only the fallback.
+/// Right after `adb pair` succeeds adb connects the device on its own and drops
+/// the `_adb-tls-connect` advertisement it had published. Let that land first:
+/// dialling the advertised port in parallel used to produce a second transport
+/// for the same phone, which then made every unscoped adb call ambiguous.
 fn finish_connection(
     adb_path: &std::path::Path,
     before: &[String],
@@ -247,15 +251,18 @@ fn finish_connection(
             return Ok(serial);
         }
 
+        if started.elapsed() < AUTO_CONNECT_GRACE {
+            thread::sleep(Duration::from_millis(400));
+            continue;
+        }
+
         // Re-pairing a phone that is already connected yields no new transport at
-        // all, so after a short grace the existing wireless one counts as success.
-        if started.elapsed() > Duration::from_secs(4) {
-            if let Some(serial) = connected_serials(adb_path)
-                .into_iter()
-                .find(|s| is_wireless_serial(s))
-            {
-                return Ok(serial);
-            }
+        // all, so the existing wireless one is the device we just paired with.
+        if let Some(serial) = connected_serials(adb_path)
+            .into_iter()
+            .find(|s| is_wireless_serial(s))
+        {
+            return Ok(serial);
         }
 
         if let Some(row) = mdns_services(adb_path)
