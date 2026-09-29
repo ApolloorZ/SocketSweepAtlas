@@ -175,6 +175,17 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
         }
         return JSON.stringify(mockScanResponse());
       });
+    case "move_items": {
+      const list = (args?.paths as string[]) ?? [];
+      const dest = String(args?.dest ?? "/sdcard");
+      return wait(600).then(() => JSON.stringify({
+        moved: list.map((path) => {
+          const name = path.slice(path.lastIndexOf("/") + 1);
+          return { from: path, to: `${dest}/${name}`, name };
+        }),
+        failed: [] as string[],
+      }));
+    }
     case "push_file": {
       const source = String(args?.localPath ?? "file");
       const name = source.split(/[\\/]/).pop() || "file";

@@ -5,7 +5,10 @@ export function findNode(root: FileNode, path: string): FileNode | null {
   if (root.path === path) return root;
   if (!root.children) return null;
   for (const child of root.children) {
-    if (child.type === "directory" && (path === child.path || path.startsWith(child.path + "/"))) {
+    // Files are leaves, so they can only be matched here — recursing into
+    // directories alone made every file lookup come back empty.
+    if (child.path === path) return child;
+    if (child.type === "directory" && path.startsWith(child.path + "/")) {
       const found = findNode(child, path);
       if (found) return found;
     }

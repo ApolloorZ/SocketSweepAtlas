@@ -4,7 +4,7 @@ import { EmptyScanScreen, ResultView } from "./ResultView";
 import { DevicePanel } from "./DevicePanel";
 import { SettingsPanel } from "./SettingsPanel";
 import { useSettings } from "./settings";
-import { addNode, removeNode } from "./tree";
+import { addNode, findNode, removeNode } from "./tree";
 import { formatBytes, formatNumber } from "./format";
 import type { AppPhase, Capacity, ScanResponse, Toast } from "./types";
 import "./App.css";
@@ -714,6 +714,43 @@ function App() {
     pushToast(`已上传 ${added} 个文件,共 ${formatBytes(bytes)}`, "success");
   }, [pushToast]);
 
+  // A move keeps the same bytes, so the totals do not change — but the source
+  // branch shrinks and the destination branch grows, or the treemap lies.
+  const handleMovePaths = useCallback(async (paths: string[], dest: string) => {
+    const base = scanDataRef.current;
+    if (!base || paths.length === 0) return;
+    addLog(`[MOVE] 正在移动 ${paths.length} 项到 ${dest}…`);
+    try {
+      const raw = await callBackend<string>("move_items", { paths, dest });
+      const result = JSON.parse(raw) as {
+        moved: { from: string; to: string; name: string }[];
+        failed: string[];
+      };
+      let tree = base.tree;
+      for (const item of result.moved) {
+        const node = findNode(tree, item.from);
+        const removed = removeNode(tree, item.from);
+        if (!node || !removed.removed) continue;
+        tree = removed.root;
+        const added = addNode(tree, dest, { ...node, path: item.to, name: item.name });
+        if (added.added) tree = added.root;
+      }
+      if (result.moved.length > 0) setScanData({ ...base, tree });
+      if (result.moved.length > 0) pushToast(`已移动 ${result.moved.length} 项`, "success");
+      if (result.failed.length > 0) {
+        setFlowError({
+          message: `${result.failed.length} 项没能移动`,
+          hints: result.failed.slice(0, 6).map((f) => `· ${f}`),
+        });
+      }
+      addLog(`[MOVE] 完成:成功 ${result.moved.length} 项,失败 ${result.failed.length} 项。`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      setFlowError({ message: translateError(message), hints: hintsFor(message) });
+      addLog(`[ERROR] ${message}`);
+    }
+  }, [addLog, pushToast]);
+
   const handleDisconnect = useCallback(async () => {
     runIdRef.current++;
     addLog("[SOCKET] 断开扫描程序…");
@@ -847,6 +884,8 @@ function App() {
             onRescan={handleRescan}
             onDisconnect={handleDisconnect}
             onDeletePaths={handleDeletePaths}
+            onMovePaths={handleMovePaths}
+            notify={(message) => pushToast(message)}
             onUploaded={handleUploaded}
             flowError={flowError}
             onDismissError={() => setFlowError(null)}

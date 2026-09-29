@@ -385,6 +385,13 @@ fn safe_remote_name(name: &str) -> String {
         .collect()
 }
 
+/// Quote a path for the device's `/system/bin/sh`. Apostrophes are the trap — a
+/// folder called `1'sdcard` silently breaks a plain `'…'` wrapper — so each one
+/// becomes the standard `'\''` sequence.
+fn shell_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', r"'\''"))
+}
+
 fn device_shell(adb_path: &std::path::Path, script: String) -> Result<String, String> {
     let serial = device_serial();
     let mut args: Vec<&str> = Vec::new();
@@ -412,7 +419,7 @@ fn free_remote_name(adb_path: &std::path::Path, dir: &str, name: &str) -> Result
             (s, None) if index == 1 => s.clone(),
             (s, None) => format!("{s} ({index})"),
         };
-        let probe = format!("test -e '{dir}/{candidate}' && echo TAKEN || echo FREE");
+        let probe = format!("test -e {} && echo TAKEN || echo FREE", shell_quote(&format!("{dir}/{candidate}")));
         let answer = device_shell(adb_path, probe).unwrap_or_else(|_| "FREE".into());
         if answer.contains("FREE") {
             return Ok(candidate);
@@ -463,7 +470,7 @@ fn push_file(app: tauri::AppHandle, local_path: String, device_dir: String) -> R
         .map_err(|e| format!("上传没能启动:{e}"))?;
 
     while let Ok(None) = child.try_wait() {
-        let probe = format!("stat -c %s '{remote}' 2>/dev/null");
+        let probe = format!("stat -c %s {} 2>/dev/null", shell_quote(&remote));
         let done = device_shell(&adb_path, probe)
             .ok()
             .and_then(|text| text.trim().parse::<i64>().ok())
@@ -483,6 +490,75 @@ fn push_file(app: tauri::AppHandle, local_path: String, device_dir: String) -> R
     }
 
     Ok(serde_json::json!({ "remote": remote, "name": target, "bytes": size }).to_string())
+}
+
+/// Moves the given device paths into `dest` with `mv`.
+///
+/// A move removes the original path, so this is the one write command that can
+/// lose data if it is careless: it refuses anything outside /sdcard, refuses to
+/// move a folder into itself, and refuses to overwrite a name that is already
+/// taken at the destination rather than quietly renaming.
+#[tauri::command(async)]
+fn move_items(app: tauri::AppHandle, paths: Vec<String>, dest: String) -> Result<String, String> {
+    let adb_path = get_bundled_binary(&app, "adb")?;
+    let dest = dest.trim_end_matches('/').to_string();
+    if !dest.starts_with("/sdcard") || dest.is_empty() {
+        return Err("只能移动到 /sdcard 下的目录。".into());
+    }
+
+    let mut moved: Vec<serde_json::Value> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+
+    for path in &paths {
+        let source = path.trim_end_matches('/').to_string();
+        let name = match source.rsplit_once('/') {
+            Some((_, tail)) if !tail.is_empty() => tail.to_string(),
+            _ => {
+                failed.push(format!("{source}:文件名无法识别"));
+                continue;
+            }
+        };
+        if !source.starts_with("/sdcard/") || source == "/sdcard" {
+            failed.push(format!("{source}:不在 /sdcard 下"));
+            continue;
+        }
+        if source == dest {
+            failed.push(format!("{source}:已经在目标目录里"));
+            continue;
+        }
+        // Moving a folder into one of its own children would take it with us.
+        if dest.starts_with(&format!("{source}/")) {
+            failed.push(format!("{source}:不能移动到自己的子目录里"));
+            continue;
+        }
+
+        let target = format!("{dest}/{name}");
+        let probe = format!("test -e {} && echo TAKEN || echo FREE", shell_quote(&target));
+        match device_shell(&adb_path, probe) {
+            Ok(answer) if answer.contains("TAKEN") => {
+                failed.push(format!("{name}:目标目录里已经有同名文件,已跳过"));
+                continue;
+            }
+            Err(err) => {
+                failed.push(format!("{name}:{err}"));
+                continue;
+            }
+            _ => {}
+        }
+
+        let script = format!("mv -- {} {} && echo MOVED", shell_quote(&source), shell_quote(&format!("{dest}/")));
+        match device_shell(&adb_path, script) {
+            Ok(out) if out.contains("MOVED") => moved.push(serde_json::json!({
+                "from": source,
+                "to": target,
+                "name": name,
+            })),
+            Ok(_) => failed.push(format!("{name}:手机拒绝了这次移动")),
+            Err(err) => failed.push(format!("{name}:{err}")),
+        }
+    }
+
+    Ok(serde_json::json!({ "moved": moved, "failed": failed }).to_string())
 }
 
 // ── Device management (USB + wireless adb) ──────────────────────────────────
@@ -1065,6 +1141,7 @@ pub fn run() {
             ping_daemon,
             stop_daemon,
             delete_item,
+            move_items,
             push_file,
             list_devices,
             pair_device,

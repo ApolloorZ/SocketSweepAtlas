@@ -174,6 +174,8 @@ export function ResultView({
   onRescan,
   onDisconnect,
   onDeletePaths,
+  onMovePaths,
+  notify,
   onUploaded,
   flowError,
   onDismissError,
@@ -183,6 +185,8 @@ export function ResultView({
   onRescan: () => void;
   onDisconnect: () => void;
   onDeletePaths: (paths: string[]) => Promise<void>;
+  onMovePaths: (paths: string[], dest: string) => Promise<void>;
+  notify: (message: string) => void;
   onUploaded: (items: { name: string; bytes: number }[], dirPath: string) => void;
   flowError: { message: string; hints: string[] } | null;
   onDismissError: () => void;
@@ -196,6 +200,7 @@ export function ResultView({
   const [selected, setSelected] = useState<Map<string, FileNode>>(new Map());
   const [confirming, setConfirming] = useState(false);
   const [downloadsOpen, setDownloadsOpen] = useState(false);
+  const [moving, setMoving] = useState(false);
   const [dragging, setDragging] = useState(false);
   const opener = useFileOpener();
 
@@ -203,6 +208,14 @@ export function ResultView({
   // so it reads the live target through a ref instead of closing over state.
   const dropTarget = useRef<{ view: View; path: string }>({ view, path: browsePath });
   dropTarget.current = { view, path: browsePath };
+
+  // Transfer failures surface as toasts rather than a strip that would push the
+  // whole list down at the worst possible moment.
+  useEffect(() => {
+    if (!opener.error) return;
+    notify(opener.error);
+    opener.clearError();
+  }, [opener.error]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { clearStatsCache(); }, [data]);
   useEffect(() => { setShown(300); }, [view, browsePath, category, query, sort]);
@@ -256,8 +269,10 @@ export function ResultView({
     setView("browse");
     setQuery("");
     setSort({ key: "size", desc: true });
-    setSelected(new Map());
-  }, []);
+    // Walking to a destination is how a move picks its target, so the marked
+    // files must survive it.
+    if (!moving) setSelected(new Map());
+  }, [moving]);
 
   const parentPath = useMemo(() => {
     const root = data.tree.path;
@@ -325,6 +340,83 @@ export function ResultView({
       else next.set(node.path, node);
       return next;
     });
+  };
+
+  // Select every row the current filter leaves visible, and undo it in one go.
+  const allSelected = rows.length > 0 && rows.every((node) => selected.has(node.path));
+  const toggleSelectAll = () => {
+    setSelected((prev) => {
+      if (allSelected) return new Map();
+      const next = new Map(prev);
+      rows.forEach((node) => next.set(node.path, node));
+      return next;
+    });
+  };
+
+  /**
+   * Paint selection: press a checkbox and drag over rows to select or deselect
+   * everything passed. The intent is taken from the first row, so dragging from a
+   * checked row clears as it goes.
+   */
+  const paint = useRef<{ want: boolean } | null>(null);
+  const [painting, setPainting] = useState(false);
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+
+  const startPaint = (node: FileNode, event: React.PointerEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const want = !selected.has(node.path);
+    paint.current = { want };
+    setPainting(true);
+    setSelected((prev) => {
+      const next = new Map(prev);
+      if (want) next.set(node.path, node);
+      else next.delete(node.path);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    if (!painting) return;
+    const onMove = (event: PointerEvent) => {
+      const current = paint.current;
+      if (!current) return;
+      const row = document.elementFromPoint(event.clientX, event.clientY)?.closest(".file-row");
+      const path = row?.getAttribute("data-path");
+      if (!path) return;
+      setSelected((prev) => {
+        const node = rowsRef.current.find((n) => n.path === path);
+        if (!node || prev.has(path) === current.want) return prev;
+        const next = new Map(prev);
+        if (current.want) next.set(node.path, node);
+        else next.delete(node.path);
+        return next;
+      });
+    };
+    const stop = () => {
+      paint.current = null;
+      setPainting(false);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+    };
+  }, [painting]);
+
+  // Moving is a two-step gesture: mark the files, walk to the folder, confirm.
+  useEffect(() => {
+    if (view !== "browse") setMoving(false);
+  }, [view]);
+  const confirmMove = async () => {
+    const paths = [...selected.keys()];
+    setMoving(false);
+    setSelected(new Map());
+    await onMovePaths(paths, browsePath);
   };
 
   const selectedSize = useMemo(() => [...selected.values()].reduce((sum, n) => sum + n.size, 0), [selected]);
@@ -435,34 +527,6 @@ export function ResultView({
         </div>
       )}
 
-      {opener.pull && (
-        <div className="px-5 py-2 border-b border-zinc-800/60 shrink-0 flex items-center gap-3 text-xs">
-          <span className="text-accent-400 shrink-0">⟳</span>
-          <div className="w-48 h-1.5 rounded-full bg-zinc-800 overflow-hidden shrink-0">
-            <div
-              className="h-full bg-accent-500 transition-[width] duration-200"
-              style={{ width: `${Math.round((opener.pull.done / Math.max(1, opener.pull.total)) * 100)}%` }}
-            />
-          </div>
-          <span className="text-zinc-400 truncate flex-1">
-            正在拉到电脑:{opener.pull.path.slice(opener.pull.path.lastIndexOf("/") + 1)}
-          </span>
-          <span className="text-zinc-600 font-mono shrink-0">
-            {formatBytes(opener.pull.done)} / {formatBytes(opener.pull.total)}
-          </span>
-        </div>
-      )}
-
-      {opener.error && (
-        <div className="px-5 py-2 border-b border-zinc-800/60 shrink-0 flex items-start gap-2 text-xs">
-          <span className="text-danger-400 mt-0.5">✕</span>
-          <span className="text-zinc-300 flex-1 break-words leading-relaxed">{opener.error}</span>
-          <button onClick={opener.clearError} className="text-zinc-500 hover:text-zinc-300 cursor-pointer shrink-0">
-            关闭
-          </button>
-        </div>
-      )}
-
       {flowError && (
         <div className="px-5 pt-3 shrink-0 flex justify-center">
           <div className="w-full max-w-md">
@@ -480,7 +544,62 @@ export function ResultView({
         </div>
       )}
 
-      <div className="flex-1 min-h-0 overflow-y-auto">
+      {/* Search, transfer progress and the upload entry — pinned, so scrolling the
+          list never takes them out of reach or shifts them around. */}
+      {(view === "browse" || view === "category") && (
+        <div className="px-5 py-2.5 border-b border-zinc-800/60 shrink-0 flex items-center gap-3">
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={view === "category" ? "搜索文件名或所在目录…" : "搜索当前目录…"}
+            className="w-64 max-w-[40%] shrink-0 bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-1.5 text-sm text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-accent-500/50"
+          />
+          <span className="text-xs text-zinc-600 shrink-0">{formatNumber(rows.length)} 项</span>
+          <div className="flex-1 min-w-0 flex items-center gap-2">
+            {opener.pull && (
+              <>
+                <div className="flex-1 min-w-6 h-1.5 rounded-full bg-zinc-800 overflow-hidden">
+                  <div
+                    className="h-full bg-accent-500 transition-[width] duration-200"
+                    style={{ width: `${Math.round((opener.pull.done / Math.max(1, opener.pull.total)) * 100)}%` }}
+                  />
+                </div>
+                <span className="text-[11px] font-mono text-zinc-500 shrink-0">
+                  {Math.round((opener.pull.done / Math.max(1, opener.pull.total)) * 100)}%
+                </span>
+              </>
+            )}
+          </div>
+          {rows.length > 0 && (
+            <button
+              id="btn-select-all"
+              onClick={toggleSelectAll}
+              title={allSelected ? "取消当前列出的选择" : `选中当前列出的 ${formatNumber(rows.length)} 项`}
+              className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer shrink-0"
+            >
+              {allSelected ? "取消全选" : "全选"}
+            </button>
+          )}
+          {selected.size > 0 && (
+            <button onClick={() => { setSelected(new Map()); setMoving(false); }} className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer shrink-0">
+              取消选择
+            </button>
+          )}
+          {view === "browse" && (
+            <button
+              id="btn-upload"
+              onClick={() => void pickUpload()}
+              title={`上传文件到 ${browsePath}`}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 border border-zinc-700/50 cursor-pointer shrink-0"
+            >
+              <IconUpload />
+              上传
+            </button>
+          )}
+        </div>
+      )}
+
+      <div className={`flex-1 min-h-0 overflow-y-auto ${painting ? "select-none" : ""}`}>
         {view === "home" && (
           <div className="px-5 py-4 flex flex-col gap-4">
             {/* ① Treemap of level-1 folders */}
@@ -564,32 +683,6 @@ export function ResultView({
 
         {(view === "browse" || view === "category") && (
           <div className="px-5 py-3">
-            <div className="flex items-center gap-3 mb-2">
-              <input
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                placeholder={view === "category" ? "搜索文件名或所在目录…" : "搜索当前目录…"}
-                className="flex-1 max-w-sm bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-1.5 text-sm text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-accent-500/50"
-              />
-              <span className="text-xs text-zinc-600">{formatNumber(rows.length)} 项</span>
-              {selected.size > 0 && (
-                <button onClick={() => setSelected(new Map())} className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer">
-                  取消选择
-                </button>
-              )}
-              {view === "browse" && (
-                <button
-                  id="btn-upload"
-                  onClick={() => void pickUpload()}
-                  title={`上传文件到 ${browsePath}`}
-                  className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 border border-zinc-700/50 cursor-pointer shrink-0"
-                >
-                  <IconUpload />
-                  上传
-                </button>
-              )}
-            </div>
-
             <div className="grid items-center gap-3 px-3 py-2 border-b border-zinc-800/80 sticky top-0 bg-surface-0/95 backdrop-blur" style={{ gridTemplateColumns: grid }}>
               <span />
               {headerCell("名称")}
@@ -612,10 +705,11 @@ export function ResultView({
               return (
                 <div
                   key={node.path}
+                  data-path={node.path}
                   onClick={() => (isDir ? openFolder(node.path) : toggleSelected(node))}
                   onDoubleClick={() => !isDir && opener.openFile(node)}
                   title={isDir ? "单击进入该目录" : "单击勾选,双击拉到电脑上打开"}
-                  className={`grid items-center gap-3 px-3 py-1.5 rounded-md file-row cursor-pointer ${checked ? "bg-accent-500/10" : ""}`}
+                  className={`grid items-center gap-3 px-3 py-1.5 rounded-md file-row cursor-pointer ${checked ? "bg-accent-500/10" : ""} ${moving && checked ? "opacity-35" : ""}`}
                   style={{ gridTemplateColumns: grid }}
                 >
                   <TypeIcon node={node} />
@@ -648,9 +742,10 @@ export function ResultView({
                       </span>
                     )}
                   <span
-                    onClick={(e) => { e.stopPropagation(); toggleSelected(node); }}
-                    title={checked ? "取消选择" : "选择这一项"}
-                    className="h-10 -my-2 flex items-center justify-center rounded-md cursor-pointer hover:bg-zinc-700/40"
+                    onPointerDown={(e) => startPaint(node, e)}
+                    onClick={(e) => e.stopPropagation()}
+                    title={checked ? "取消选择(按住拖动可连续取消)" : "选择这一项(按住拖动可连续选择)"}
+                    className="h-10 -my-2 flex items-center justify-center rounded-md cursor-pointer hover:bg-zinc-700/40 touch-none select-none"
                   >
                     <input
                       type="checkbox"
@@ -679,33 +774,68 @@ export function ResultView({
       {/* Selection bar */}
       {selected.size > 0 && (
         <div className="shrink-0 border-t border-zinc-800 bg-zinc-900/95 backdrop-blur px-5 py-3 flex items-center gap-4">
-          <span className="text-sm text-zinc-300">已选 <span className="font-mono text-accent-400">{selected.size}</span> 项</span>
-          <span className="text-sm text-zinc-500">合计 <span className="font-mono text-zinc-200">{formatBytes(selectedSize)}</span></span>
-          {selectedFiles.length > 0 && (
-            <span className="text-xs text-zinc-600">其中 {selectedFiles.length} 个文件可下载</span>
+          {moving ? (
+            <>
+              <span className="text-sm text-accent-300 shrink-0">把 {selected.size} 项移动到</span>
+              <span className="text-sm font-mono text-zinc-200 truncate flex-1 min-w-0" title={browsePath}>{browsePath}</span>
+              <span className="text-[11px] text-zinc-600 shrink-0">同名文件不会被覆盖</span>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={() => setMoving(false)}
+                  className="px-4 py-2 rounded-lg text-sm font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 cursor-pointer"
+                >
+                  取消
+                </button>
+                <button
+                  id="btn-move-here"
+                  onClick={() => void confirmMove()}
+                  className="px-4 py-2 rounded-lg text-sm font-bold bg-gradient-to-r from-accent-600 to-accent-500 text-white hover:from-accent-500 hover:to-accent-400 cursor-pointer"
+                >
+                  移动到此处
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <span className="text-sm text-zinc-300">已选 <span className="font-mono text-accent-400">{selected.size}</span> 项</span>
+              <span className="text-sm text-zinc-500">合计 <span className="font-mono text-zinc-200">{formatBytes(selectedSize)}</span></span>
+              {selectedFiles.length > 0 && (
+                <span className="text-xs text-zinc-600">其中 {selectedFiles.length} 个文件可下载</span>
+              )}
+              <div className="ml-auto flex items-center gap-2">
+                <button
+                  onClick={() => {
+                    setDownloadsOpen(true);
+                    void opener.downloadFiles([...selected.values()]);
+                    // The queue now lives in the downloads panel, so the ticks have
+                    // done their job and only get in the way.
+                    setSelected(new Map());
+                  }}
+                  disabled={selectedFiles.length === 0 || opener.downloading}
+                  title={selectedFiles.length === 0 ? "所选里没有可下载的文件(文件夹不能直接下载)" : "把所选文件拉到电脑的下载文件夹,保留原文件名,不自动打开"}
+                  className="px-4 py-2 rounded-lg text-sm font-semibold bg-zinc-800 text-accent-400 border border-accent-500/30 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                >
+                  {opener.downloading ? "正在下载…" : "⬇ 下载所选"}
+                </button>
+                {view === "browse" && (
+                  <button
+                    id="btn-move"
+                    onClick={() => setMoving(true)}
+                    title="选好后再进入目标文件夹,点「移动到此处」;手机上的同名文件不会被覆盖"
+                    className="px-4 py-2 rounded-lg text-sm font-semibold bg-zinc-800 text-zinc-200 border border-zinc-700 hover:bg-zinc-700 cursor-pointer"
+                  >
+                    → 移动
+                  </button>
+                )}
+                <button
+                  onClick={() => setConfirming(true)}
+                  className="px-4 py-2 rounded-lg text-sm font-bold bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-500/20 cursor-pointer"
+                >
+                  删除所选
+                </button>
+              </div>
+            </>
           )}
-          <div className="ml-auto flex items-center gap-2">
-            <button
-              onClick={() => {
-                setDownloadsOpen(true);
-                void opener.downloadFiles([...selected.values()]);
-                // The queue now lives in the downloads panel, so the ticks have
-                // done their job and only get in the way.
-                setSelected(new Map());
-              }}
-              disabled={selectedFiles.length === 0 || opener.downloading}
-              title={selectedFiles.length === 0 ? "所选里没有可下载的文件(文件夹不能直接下载)" : "把所选文件拉到电脑的下载文件夹,保留原文件名,不自动打开"}
-              className="px-4 py-2 rounded-lg text-sm font-semibold bg-zinc-800 text-accent-400 border border-accent-500/30 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
-            >
-              {opener.downloading ? "正在下载…" : "⬇ 下载所选"}
-            </button>
-            <button
-              onClick={() => setConfirming(true)}
-              className="px-4 py-2 rounded-lg text-sm font-bold bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-500/20 cursor-pointer"
-            >
-              删除所选
-            </button>
-          </div>
         </div>
       )}
 
