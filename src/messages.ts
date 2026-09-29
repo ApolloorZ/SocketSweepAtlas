@@ -338,6 +338,7 @@ export const MESSAGES: Record<string, [zh: string, en: string]> = {
   "be.no_usb_device": ["没有找到设备:这台电脑上没有处于 USB 调试状态的手机。", "No device found: no phone on this computer is in USB debugging state."],
   "be.scan_status": ["扫描返回了异常状态:{arg}", "The scan reported a bad status: {arg}"],
   "be.cancelled": ["已取消。", "Cancelled."],
+  "be.inflate_failed": ["扫描结果解压失败:{arg}", "The scan answer could not be unzipped: {arg}"],
   "be.peek_outside_sdcard": ["只能预览手机 /sdcard 下的文件。", "Only files under /sdcard can be previewed."],
   "be.peek_failed": ["读不到文件的开头:{arg}", "The head of the file could not be read: {arg}"],
   "be.peek_failed_empty": ["手机没吐出任何内容,这个文件可能读不到。", "The phone returned nothing; this file may not be readable."],

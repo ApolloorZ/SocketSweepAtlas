@@ -21,6 +21,10 @@
 #include <filesystem>
 #include <iostream>
 
+// Linked statically from the NDK sysroot, so the binary carries no runtime
+// dependency on a system library that might not be exposed to it.
+#include <zlib.h>
+
 // ── Configuration ───────────────────────────────────────────────────────────
 namespace cfg {
     constexpr uint16_t    PORT              = 5050;
@@ -70,34 +74,16 @@ static bool path_is_safe_to_delete(const std::string& target, const std::string&
 class JsonStream {
     int fd;
     std::string buf;
-public:
-    JsonStream(int fd) : fd(fd) {
-        buf.reserve(64 * 1024);
-    }
-    ~JsonStream() { flush(); }
-    
-    bool write(const char* data, size_t len) {
-        if (buf.size() + len > buf.capacity()) {
-            if (!flush()) return false;
-        }
-        if (len >= buf.capacity()) {
-            return send_all(fd, data, len);
-        } else {
-            buf.append(data, len);
-            return true;
-        }
-    }
-    
-    bool write(const std::string& s) { return write(s.data(), s.size()); }
-    
-    bool flush() {
-        if (!buf.empty()) {
-            bool ok = send_all(fd, buf.data(), buf.size());
-            buf.clear();
-            return ok;
-        }
-        return true;
-    }
+    // The scan answer is tens of megabytes of repeated path prefixes, and the
+    // wireless adb tunnel carries about 2.4 MB/s — the payload IS the wait. When
+    // gzip is on, everything written here leaves compressed; the bytes themselves
+    // are unchanged, so the computer only has to unzip before parsing.
+    bool gz_on = false;
+    z_stream zs{};
+    // A tunnel that drops mid-transfer used to go unnoticed: every caller ignores
+    // write()'s result, so the answer was simply shorter than it should have been.
+    // Recording it here turns that into a visible failure instead.
+    bool broken = false;
 
     static bool send_all(int fd, const char* p, size_t left) {
         while (left > 0) {
@@ -108,6 +94,91 @@ public:
             left -= static_cast<size_t>(n);
         }
         return true;
+    }
+
+    bool send_out(const char* p, size_t len) {
+        const bool ok = send_all(fd, p, len);
+        if (!ok) broken = true;
+        return ok;
+    }
+
+    // Pushes whatever is buffered through deflate and sends what came out.
+    bool pump(bool final) {
+        if (buf.empty() && !final) return true;
+        zs.next_in  = reinterpret_cast<Bytef*>(const_cast<char*>(buf.data()));
+        zs.avail_in = static_cast<uInt>(buf.size());
+        char outbuf[32 * 1024];
+        int rc;
+        do {
+            zs.next_out  = reinterpret_cast<Bytef*>(outbuf);
+            zs.avail_out = static_cast<uInt>(sizeof(outbuf));
+            rc = deflate(&zs, final ? Z_FINISH : Z_NO_FLUSH);
+            size_t produced = sizeof(outbuf) - zs.avail_out;
+            if (produced > 0 && !send_out(outbuf, produced)) return false;
+            if (rc == Z_BUF_ERROR) break;
+            if (rc != Z_OK && rc != Z_STREAM_END) return false;
+        } while (final ? rc != Z_STREAM_END : (zs.avail_in > 0 || zs.avail_out == 0));
+        buf.clear();
+        return true;
+    }
+
+public:
+    JsonStream(int fd) : fd(fd) {
+        buf.reserve(64 * 1024);
+    }
+    ~JsonStream() {
+        if (gz_on) { pump(true); deflateEnd(&zs); }
+        else { flush(); }
+    }
+
+    /// Starts a gzip member. On failure the stream stays plain, which is slower
+    /// but still correct — compression must never be able to break a scan.
+    bool gzip_start() {
+        if (gz_on) return true;
+        if (deflateInit2(&zs, Z_BEST_SPEED, Z_DEFLATED, 16 + 15, 8, Z_DEFAULT_STRATEGY) != Z_OK) return false;
+        gz_on = true;
+        return true;
+    }
+
+    bool write(const char* data, size_t len) {
+        if (gz_on) {
+            buf.append(data, len);
+            return buf.size() < 32 * 1024 ? true : pump(false);
+        }
+        if (buf.size() + len > buf.capacity()) {
+            if (!flush()) return false;
+        }
+        if (len >= buf.capacity()) {
+            return send_out(data, len);
+        } else {
+            buf.append(data, len);
+            return true;
+        }
+    }
+
+    bool write(const std::string& s) { return write(s.data(), s.size()); }
+
+    bool flush() {
+        if (gz_on) return pump(false);
+        if (!buf.empty()) {
+            bool ok = send_out(buf.data(), buf.size());
+            buf.clear();
+            return ok;
+        }
+        return true;
+    }
+
+    /// False once a send has failed: the answer is incomplete and must not be
+    /// presented as if it were good.
+    bool ok() const { return !broken; }
+
+    /// Closes the gzip member so the reader gets a valid trailer.
+    bool finish() {
+        if (!gz_on) return flush();
+        bool ok = pump(true);
+        deflateEnd(&zs);
+        gz_on = false;
+        return ok;
     }
 };
 
@@ -331,6 +402,10 @@ static void handle_client(int fd) {
         std::fprintf(stderr, "[engine] SCAN \"%s\" ...\n", root.c_str());
         g_scan_root = root;  // store for delete validation
 
+        // Compress the answer; if zlib refuses to start, send it plain. A slower
+        // scan is acceptable, a broken one is not.
+        if (!out.gzip_start()) std::fprintf(stderr, "[engine] gzip unavailable, sending plain\n");
+
         auto t0 = std::chrono::steady_clock::now();
         ScanStats stats{};
         FileNode tree = scan(root, root_name, stats, 0);
@@ -360,7 +435,11 @@ static void handle_client(int fd) {
     else {
         out.write("{\"status\":\"error\",\"message\":\"Unknown command\"}\n");
     }
-    out.flush();
+    // Closes the gzip member, which is what lets the reader know the answer ends here.
+    const bool sent = out.finish();
+    if (!sent || !out.ok()) {
+        std::fprintf(stderr, "[engine] answer incomplete: the tunnel broke mid-transfer\n");
+    }
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────

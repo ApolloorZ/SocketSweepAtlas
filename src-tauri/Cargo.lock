@@ -3438,6 +3438,7 @@ dependencies = [
 name = "tauri-app"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "qrcode",
  "rand",
  "serde",

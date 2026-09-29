@@ -165,17 +165,14 @@ fn adb_s(adb_path: &std::path::Path, args: &[&str]) -> Result<String, String> {
 /// Send a one-line command to the daemon and read the full response.
 /// Where the time actually goes on a scan. Only printed for large replies, so
 /// the PING and DELETE traffic stays quiet in the dev log.
-fn note_stage(bytes: usize, connect: Duration, sent: Duration, read: Duration, decoded: Duration) {
-    if bytes < 1024 * 1024 {
+fn note_stage(wire: usize, plain: usize, connect: f64, send: f64, read: f64, unzip: f64, to_string: f64) {
+    if wire < 1024 * 1024 {
         return;
     }
     println!(
-        "[TIMING] rust: 连接 {:.1}ms 发送 {:.1}ms 读取 {:.1}ms 转字符串 {:.1}ms · {} MB",
-        connect.as_secs_f64() * 1000.0,
-        sent.as_secs_f64() * 1000.0,
-        read.as_secs_f64() * 1000.0,
-        decoded.as_secs_f64() * 1000.0,
-        bytes / 1024 / 1024
+        "[TIMING] rust: 连接 {connect:.1}ms 发送 {send:.1}ms 读取 {read:.1}ms 解压 {unzip:.1}ms 转字符串 {to_string:.1}ms · 线上 {:.1} MB → 展开 {:.1} MB",
+        wire as f64 / 1048576.0,
+        plain as f64 / 1048576.0
     );
 }
 
@@ -208,8 +205,33 @@ fn daemon_command(cmd: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to read daemon response: {e}"))?;
     let read = started.elapsed();
 
-    let response = String::from_utf8_lossy(&response_bytes).trim().to_string();
-    note_stage(response_bytes.len(), connected, sent, read, started.elapsed());
+    // The scan answer arrives gzipped: the phone produces it far faster than the
+    // wireless adb tunnel can carry it. PING and DELETE are still plain text, so
+    // the two magic bytes decide rather than a flag that could lie.
+    let wire = response_bytes.len();
+    let plain = if response_bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut out = Vec::with_capacity(wire * 6);
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&response_bytes[..]), &mut out)
+            .map_err(|e| err_arg("inflate_failed", e))?;
+        out
+    } else {
+        response_bytes
+    };
+    let unzipped = started.elapsed();
+
+    let response = String::from_utf8_lossy(&plain).trim().to_string();
+    let decoded = started.elapsed();
+
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    note_stage(
+        wire,
+        plain.len(),
+        ms(connected),
+        ms(sent - connected),
+        ms(read - sent),
+        ms(unzipped - read),
+        ms(decoded - unzipped),
+    );
     Ok(response)
 }
 
@@ -335,7 +357,14 @@ fn run_scan(path: Option<String>) -> Result<String, String> {
         _ => "/sdcard".to_string(), // daemon default
     };
     let cmd = format!("SCAN {effective_root}");
-    let response = daemon_command(&cmd)?;
+    let response = match daemon_command(&cmd) {
+        Ok(answer) => answer,
+        // A wireless tunnel that breaks mid-transfer leaves a truncated answer.
+        // Asking once more beats making him press the button again; a second
+        // failure is a real problem and goes to him as one.
+        Err(e) if e.starts_with("E#inflate_failed") => daemon_command(&cmd)?,
+        Err(e) => return Err(e),
+    };
 
     // Store the scan root so delete_item can guard against it.
     if let Ok(mut root) = SCAN_ROOT.lock() {
