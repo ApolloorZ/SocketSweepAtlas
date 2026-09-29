@@ -30,11 +30,18 @@ function dir(name: string, path: string, children: FileNode[]): FileNode {
   };
 }
 
-function mediaFiles(prefix: string, count: number, min: number, max: number): FileNode[] {
+/**
+ * Files carry the path of the folder they sit in, exactly like the daemon does:
+ * every tree operation in the app walks by path, so a fake `/mock/...` path that
+ * does not match its parent makes moves and file deletes silently no-op here and
+ * pass in the harness while they are broken on the phone.
+ */
+function mediaFiles(parent: string, prefix: string, count: number, min: number, max: number): FileNode[] {
   const out: FileNode[] = [];
   for (let i = 0; i < count; i++) {
     const size = Math.round(min + rnd() * (max - min));
-    out.push(file(`${prefix}_${String(i).padStart(4, "0")}.jpg`, `/mock/${prefix}_${i}.jpg`, size));
+    const name = `${prefix}_${String(i).padStart(4, "0")}.jpg`;
+    out.push(file(name, `${parent}/${name}`, size));
   }
   return out.sort((a, b) => b.size - a.size);
 }
@@ -44,23 +51,23 @@ function buildTree(): FileNode {
   const MB = 1024 ** 2;
 
   const camera = dir("Camera", "/sdcard/DCIM/Camera", [
-    ...mediaFiles("VID", 40, 80 * MB, 1.4 * GB),
-    ...mediaFiles("IMG", 900, 1.5 * MB, 9 * MB),
+    ...mediaFiles("/sdcard/DCIM/Camera", "VID", 40, 80 * MB, 1.4 * GB),
+    ...mediaFiles("/sdcard/DCIM/Camera", "IMG", 900, 1.5 * MB, 9 * MB),
   ]);
-  const screenshots = dir("Screenshots", "/sdcard/DCIM/Screenshots", mediaFiles("SCR", 120, 0.4 * MB, 2 * MB));
+  const screenshots = dir("Screenshots", "/sdcard/DCIM/Screenshots", mediaFiles("/sdcard/DCIM/Screenshots", "SCR", 120, 0.4 * MB, 2 * MB));
   const dcim = dir("DCIM", "/sdcard/DCIM", [camera, screenshots]);
 
   const whatsapp = dir("WhatsApp", "/sdcard/Android/media/com.whatsapp/WhatsApp", [
     dir("Media", "/sdcard/Android/media/com.whatsapp/WhatsApp/Media", [
-      dir("WhatsApp Videos", "/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Videos", mediaFiles("WV", 60, 5 * MB, 200 * MB)),
-      dir("WhatsApp Images", "/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images", mediaFiles("WI", 400, 0.2 * MB, 4 * MB)),
+      dir("WhatsApp Videos", "/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Videos", mediaFiles("/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Videos", "WV", 60, 5 * MB, 200 * MB)),
+      dir("WhatsApp Images", "/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images", mediaFiles("/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images", "WI", 400, 0.2 * MB, 4 * MB)),
     ]),
   ]);
 
   const games = dir("Tencent", "/sdcard/Tencent", [
     dir("MicroMsg", "/sdcard/Tencent/MicroMsg", [
       dir("weiXin", "/sdcard/Tencent/MicroMsg/weiXin", [
-        dir("attachment", "/sdcard/Tencent/MicroMsg/weiXin/attachment", mediaFiles("WX", 300, 0.5 * MB, 60 * MB)),
+        dir("attachment", "/sdcard/Tencent/MicroMsg/weiXin/attachment", mediaFiles("/sdcard/Tencent/MicroMsg/weiXin/attachment", "WX", 300, 0.5 * MB, 60 * MB)),
       ]),
     ]),
   ]);
@@ -68,24 +75,24 @@ function buildTree(): FileNode {
   const android = dir("Android", "/sdcard/Android", [
     dir("data", "/sdcard/Android/data", [
       dir("com.tencent.mm", "/sdcard/Android/data/com.tencent.mm", [
-        dir("cache", "/sdcard/Android/data/com.tencent.mm/cache", mediaFiles("MMC", 220, 0.1 * MB, 30 * MB)),
+        dir("cache", "/sdcard/Android/data/com.tencent.mm/cache", mediaFiles("/sdcard/Android/data/com.tencent.mm/cache", "MMC", 220, 0.1 * MB, 30 * MB)),
       ]),
       dir("com.bilibili.app.blue", "/sdcard/Android/data/com.bilibili.app.blue", [
-        dir("files", "/sdcard/Android/data/com.bilibili.app.blue/files", mediaFiles("BL", 180, 2 * MB, 120 * MB)),
+        dir("files", "/sdcard/Android/data/com.bilibili.app.blue/files", mediaFiles("/sdcard/Android/data/com.bilibili.app.blue/files", "BL", 180, 2 * MB, 120 * MB)),
       ]),
     ]),
     dir("obb", "/sdcard/Android/obb", [
-      dir("com.miHoYo.hkrpg", "/sdcard/Android/obb/com.miHoYo.hkrpg", mediaFiles("OBB", 8, 200 * MB, 1.1 * GB)),
+      dir("com.miHoYo.hkrpg", "/sdcard/Android/obb/com.miHoYo.hkrpg", mediaFiles("/sdcard/Android/obb/com.miHoYo.hkrpg", "OBB", 8, 200 * MB, 1.1 * GB)),
     ]),
   ]);
 
-  const music = dir("Music", "/sdcard/Music", mediaFiles("MUS", 150, 3 * MB, 15 * MB));
-  const movies = dir("Movies", "/sdcard/Movies", mediaFiles("MOV", 25, 200 * MB, 2.2 * GB));
+  const music = dir("Music", "/sdcard/Music", mediaFiles("/sdcard/Music", "MUS", 150, 3 * MB, 15 * MB));
+  const movies = dir("Movies", "/sdcard/Movies", mediaFiles("/sdcard/Movies", "MOV", 25, 200 * MB, 2.2 * GB));
   const download = dir("Download", "/sdcard/Download", [
-    ...mediaFiles("APK", 30, 20 * MB, 300 * MB),
-    ...mediaFiles("PDF", 45, 0.2 * MB, 12 * MB),
+    ...mediaFiles("/sdcard/Download", "APK", 30, 20 * MB, 300 * MB),
+    ...mediaFiles("/sdcard/Download", "PDF", 45, 0.2 * MB, 12 * MB),
   ]);
-  const documents = dir("Documents", "/sdcard/Documents", mediaFiles("DOC", 60, 0.05 * MB, 6 * MB));
+  const documents = dir("Documents", "/sdcard/Documents", mediaFiles("/sdcard/Documents", "DOC", 60, 0.05 * MB, 6 * MB));
 
   return dir("sdcard", "/sdcard", [dcim, android, whatsapp, games, movies, download, music, documents]);
 }

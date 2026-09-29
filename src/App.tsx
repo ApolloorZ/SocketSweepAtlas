@@ -562,6 +562,16 @@ function App() {
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 300);
   }, []);
 
+  /** The capacity strip is a `df` snapshot taken at connect time, so anything
+   *  that changes the phone's usage has to ask again or it quietly keeps lying. */
+  const refreshCapacity = useCallback(async () => {
+    try {
+      setCapacity(JSON.parse(await callBackend<string>("get_storage_info")) as Capacity);
+    } catch (err: unknown) {
+      addLog(`[CAPACITY] ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, [addLog]);
+
   const markStep = useCallback((key: string, state: StepState) => {
     activeStepRef.current = key;
     setSteps((prev) => prev.map((s) => (s.key === key ? { ...s, state } : s)));
@@ -744,7 +754,8 @@ function App() {
       total_size: base.total_size + bytes,
     });
     pushToast("toast.uploaded", "success", { count: added, size: formatBytes(bytes) });
-  }, [pushToast]);
+    void refreshCapacity();
+  }, [pushToast, refreshCapacity]);
 
   // A move keeps the same bytes, so the totals do not change — but the source
   // branch shrinks and the destination branch grows, or the treemap lies.
@@ -850,15 +861,8 @@ function App() {
     const okCount = paths.length - failed.length;
     if (okCount > 0) pushToast("toast.deleted", "success", { count: okCount, size: formatBytes(freed) });
 
-    // The capacity strip came from `df` at connect time; after freeing gigabytes
-    // it has to be asked again or it keeps showing the old numbers.
-    if (freed > 0) {
-      try {
-        setCapacity(JSON.parse(await callBackend<string>("get_storage_info")) as Capacity);
-      } catch (err: unknown) {
-        addLog(`[CAPACITY] ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
+    // Gigabytes just went away; the strip has to be asked again.
+    if (freed > 0) await refreshCapacity();
     if (failed.length > 0) {
       setFlowError({
         message: "err.deleteFailed",
@@ -867,7 +871,7 @@ function App() {
       });
     }
     addLog("log.deleteDone", { ok: okCount, failed: failed.length, size: formatBytes(freed) });
-  }, [addLog, pushToast]);
+  }, [addLog, pushToast, refreshCapacity]);
 
   useEffect(() => {
     const timers = timerRefs.current;
