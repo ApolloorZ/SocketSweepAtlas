@@ -16,15 +16,9 @@ for (const [category, exts] of Object.entries(EXTENSIONS) as [Category, string[]
 
 export const CATEGORY_ORDER: Category[] = ["video", "image", "audio", "document", "apk", "archive", "other"];
 
-export const CATEGORY_LABELS: Record<Category, string> = {
-  video: "视频",
-  image: "图片",
-  audio: "音频",
-  document: "文档",
-  apk: "安装包",
-  archive: "压缩包",
-  other: "其他",
-};
+export function categoryLabel(t: (key: string) => string, category: Category): string {
+  return t(`cat.${category}`);
+}
 
 export function categoryOf(fileName: string): Category {
   const dot = fileName.lastIndexOf(".");

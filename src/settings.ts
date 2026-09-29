@@ -1,9 +1,12 @@
 import { useCallback, useState } from "react";
+import type { Lang } from "./i18n";
 
 export type Theme = "dark" | "light";
 
 export interface Settings {
   theme: Theme;
+  /** Which language every label in the app is drawn in. */
+  lang: Lang;
   /** Show the developer log strip without the user opening it first. */
   logsOpen: boolean;
   /** Cached copies older than the rest get dropped once the folder passes this. */
@@ -19,6 +22,7 @@ export const MB = 1024 * 1024;
 
 export const DEFAULT_SETTINGS: Settings = {
   theme: "dark",
+  lang: "zh",
   logsOpen: false,
   cacheLimitMb: 2048,
   cachePath: null,

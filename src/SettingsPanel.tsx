@@ -4,6 +4,7 @@ import { formatBytes } from "./format";
 import { Panel } from "./Panel";
 import { MB, type Settings } from "./settings";
 import { Switch } from "./Switch";
+import { LANGUAGE_CHOICES, say, useI18n, type Lang, type Params } from "./i18n";
 
 interface DirStats {
   files: number;
@@ -11,14 +12,14 @@ interface DirStats {
   path: string;
 }
 
-function Choice({
+function Choice<V extends string | number>({
   value,
   options,
   onChange,
 }: {
-  value: number;
-  options: { value: number; label: string }[];
-  onChange: (value: number) => void;
+  value: V;
+  options: { value: V; label: string }[];
+  onChange: (value: V) => void;
 }) {
   return (
     <div className="flex flex-wrap gap-1.5 justify-end">
@@ -67,6 +68,7 @@ function PathRow({
   onPick: () => void;
   onReset: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="py-3 border-b border-zinc-800/70 last:border-b-0">
       <div className="text-sm text-zinc-200 mb-2">{title}</div>
@@ -75,20 +77,20 @@ function PathRow({
           title={path ?? undefined}
           className="flex-1 min-w-0 truncate px-2.5 py-1.5 rounded-lg bg-zinc-950 border border-zinc-800 text-[11px] font-mono text-zinc-400"
         >
-          {path ?? "正在读取…"}
+          {path ?? t("set.reading")}
         </code>
         <button
           onClick={onPick}
           className="px-3 py-1.5 rounded-lg text-[11px] font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 cursor-pointer shrink-0"
         >
-          选择文件夹
+          {t("set.pick")}
         </button>
         {custom && (
           <button
             onClick={onReset}
             className="px-3 py-1.5 rounded-lg text-[11px] text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 cursor-pointer shrink-0"
           >
-            恢复默认
+            {t("set.reset")}
           </button>
         )}
       </div>
@@ -145,9 +147,10 @@ export function SettingsPanel({
   onOpenDevices: () => void;
   onClose: () => void;
 }) {
+  const { t } = useI18n();
   const [cache, setCache] = useState<DirStats | null>(null);
   const [downloads, setDownloads] = useState<DirStats | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ key: string; params?: Params } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
 
@@ -166,12 +169,12 @@ export function SettingsPanel({
     refresh();
   }, [refresh]);
 
-  const act = async (label: string, fn: () => Promise<string>) => {
+  const act = async (key: string, fn: () => Promise<string>, params?: Params) => {
     setError(null);
     setNotice(null);
     try {
       await fn();
-      setNotice(label);
+      setNotice({ key, params });
       await refresh();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -185,7 +188,7 @@ export function SettingsPanel({
     try {
       await callBackend<string>("set_paths", { [key === "cachePath" ? "cache" : "download"]: value ?? "" });
       onPatch({ [key]: value } as Partial<Settings>);
-      setNotice(value ? "已改用新的位置。" : "已恢复默认位置。");
+      setNotice({ key: value ? "set.pathChanged" : "set.pathReset" });
       await refresh();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
@@ -198,36 +201,43 @@ export function SettingsPanel({
   };
 
   return (
-    <Panel title="设置" onClose={onClose}>
-      <Group title="外观">
-        <Row title="深色模式" note="整套界面一起切换">
+    <Panel title={t("app.settings")} onClose={onClose}>
+      <Group title={t("set.groupAppearance")}>
+        <Row title={t("set.dark")} note={t("set.darkNote")}>
           <Switch
             on={settings.theme === "dark"}
             onToggle={() => onPatch({ theme: settings.theme === "dark" ? "light" : "dark" })}
-            label={settings.theme === "dark" ? "切换到浅色" : "切换到深色"}
+            label={settings.theme === "dark" ? t("set.darkToLight") : t("set.darkToDeep")}
+          />
+        </Row>
+        <Row title={t("set.language")} note={t("set.languageNote")}>
+          <Choice<Lang>
+            value={settings.lang}
+            options={LANGUAGE_CHOICES}
+            onChange={(lang) => onPatch({ lang })}
           />
         </Row>
       </Group>
 
-      <Group title="扫描">
-        <Row title="详细日志默认展开" note="排查连接问题时才有用">
-          <Switch on={settings.logsOpen} onToggle={() => onPatch({ logsOpen: !settings.logsOpen })} label="详细日志默认展开" />
+      <Group title={t("set.groupScan")}>
+        <Row title={t("set.logs")} note={t("set.logsNote")}>
+          <Switch on={settings.logsOpen} onToggle={() => onPatch({ logsOpen: !settings.logsOpen })} label={t("set.logs")} />
         </Row>
       </Group>
 
-      <Group title="缓存">
+      <Group title={t("set.groupCache")}>
         <PathRow
-          title="缓存位置"
-          note="双击打开的文件先落到这里;必须是个空文件夹,里面的东西会被自动清理"
+          title={t("set.cachePath")}
+          note={t("set.cachePathNote")}
           path={cache?.path ?? null}
           custom={Boolean(settings.cachePath)}
-          onPick={() => void chooseFolder("cachePath", "缓存", cache?.path ?? null)}
+          onPick={() => void chooseFolder("cachePath", t("set.groupCache"), cache?.path ?? null)}
           onReset={() => void applyPath("cachePath", null)}
         />
 
         <Row
-          title={cache ? `${formatBytes(cache.bytes)} · ${cache.files} 个文件` : "正在统计…"}
-          note="电脑上的副本,删了不影响手机原件"
+          title={cache ? t("set.used", { size: formatBytes(cache.bytes), count: cache.files }) : t("set.counting")}
+          note={t("set.cacheNote")}
         >
           {confirmClear ? (
             <div className="flex gap-2 shrink-0">
@@ -235,45 +245,45 @@ export function SettingsPanel({
                 danger
                 onClick={() => {
                   setConfirmClear(false);
-                  void act("缓存已清空。", () => callBackend<string>("trim_cache", { limitBytes: 0, all: true }));
+                  void act("set.cleared", () => callBackend<string>("trim_cache", { limitBytes: 0, all: true }));
                 }}
               >
-                确定清空
+                {t("set.confirmClear")}
               </Small>
-              <Small onClick={() => setConfirmClear(false)}>取消</Small>
+              <Small onClick={() => setConfirmClear(false)}>{t("common.cancel")}</Small>
             </div>
           ) : (
             <div className="flex gap-2 shrink-0">
-              <Small onClick={() => void act("已在资源管理器里打开。", () => callBackend("reveal_folder", { kind: "cache" }))}>
-                打开文件夹
+              <Small onClick={() => void act("set.openedFolder", () => callBackend("reveal_folder", { kind: "cache" }))}>
+                {t("set.openFolder")}
               </Small>
               <Small onClick={() => setConfirmClear(true)} disabled={!cache || cache.files === 0}>
-                清空缓存
+                {t("set.clearCache")}
               </Small>
             </div>
           )}
         </Row>
 
-        <Row title="缓存上限" note="超出后自动丢掉最旧的副本">
+        <Row title={t("set.limit")} note={t("set.limitNote")}>
           <Choice
             value={settings.cacheLimitMb}
             options={[
               { value: 512, label: "512 MB" },
               { value: 2048, label: "2 GB" },
               { value: 10240, label: "10 GB" },
-              { value: 1024 * 1024, label: "不清理" },
+              { value: 1024 * 1024, label: t("set.limitNone") },
             ]}
             onChange={(cacheLimitMb) => {
               onPatch({ cacheLimitMb });
               void act(
-                "已按新上限整理过缓存。",
+                "set.trimmed",
                 () => callBackend<string>("trim_cache", { limitBytes: cacheLimitMb * MB, all: false })
               );
             }}
           />
         </Row>
 
-        <Row title="退出软件前清空缓存" note="关窗口时删掉所有缓存副本">
+        <Row title={t("set.exitClear")} note={t("set.exitClearNote")}>
           <Switch
             on={settings.clearCacheOnExit}
             onToggle={() => {
@@ -281,47 +291,47 @@ export function SettingsPanel({
               onPatch({ clearCacheOnExit: next });
               void callBackend("set_paths", { clearOnExit: next }).catch(() => undefined);
             }}
-            label="退出软件前清空缓存"
+            label={t("set.exitClear")}
           />
         </Row>
       </Group>
 
-      <Group title="下载">
+      <Group title={t("set.groupDownload")}>
         <PathRow
-          title="下载位置"
-          note="「下载所选」落在这里,保留原文件名,不自动清理"
+          title={t("set.dlPath")}
+          note={t("set.dlPathNote")}
           path={downloads?.path ?? null}
           custom={Boolean(settings.downloadPath)}
-          onPick={() => void chooseFolder("downloadPath", "下载", downloads?.path ?? null)}
+          onPick={() => void chooseFolder("downloadPath", t("set.groupDownload"), downloads?.path ?? null)}
           onReset={() => void applyPath("downloadPath", null)}
         />
 
         <Row
-          title={downloads ? `${formatBytes(downloads.bytes)} · ${downloads.files} 个文件` : "正在统计…"}
-          note="重名自动加 (2),不覆盖已有文件"
+          title={downloads ? t("set.used", { size: formatBytes(downloads.bytes), count: downloads.files }) : t("set.counting")}
+          note={t("set.dlNote")}
         >
-          <Small onClick={() => void act("已在资源管理器里打开。", () => callBackend("reveal_folder", { kind: "download" }))}>
-            打开文件夹
+          <Small onClick={() => void act("set.openedFolder", () => callBackend("reveal_folder", { kind: "download" }))}>
+            {t("set.openFolder")}
           </Small>
         </Row>
       </Group>
 
-      <Group title="设备">
+      <Group title={t("set.groupDevice")}>
         <Row
-          title={target ? `已指定:${target}` : "自动使用检测到的第一台"}
-          note="同时连着线和无线时更保险"
+          title={target ? t("set.deviceTarget", { target }) : t("set.deviceAuto")}
+          note={t("set.deviceNote")}
         >
           <div className="flex gap-2 shrink-0">
-            <Small onClick={onOpenDevices}>管理设备与配对</Small>
-            {target && <Small onClick={onResetTarget}>改回自动</Small>}
+            <Small onClick={onOpenDevices}>{t("set.manageDevices")}</Small>
+            {target && <Small onClick={onResetTarget}>{t("set.backAuto")}</Small>}
           </div>
         </Row>
       </Group>
 
-      {notice && <p className="text-xs text-emerald-400 leading-relaxed break-words">✓ {notice}</p>}
+      {notice && <p className="text-xs text-emerald-400 leading-relaxed break-words">✓ {t(notice.key, notice.params)}</p>}
       {error && (
         <div className="rounded-lg border border-danger-500/40 bg-danger-500/5 px-3 py-2">
-          <p className="text-xs text-zinc-300 leading-relaxed break-words">✕ {error}</p>
+          <p className="text-xs text-zinc-300 leading-relaxed break-words">✕ {say(t, error)}</p>
         </div>
       )}
     </Panel>

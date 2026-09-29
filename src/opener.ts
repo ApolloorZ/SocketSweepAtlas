@@ -56,7 +56,7 @@ export interface QueueItem {
 
 export interface SpaceAsk {
   /** Which volume is short: the PC's, or the phone's. */
-  scope: "电脑磁盘" | "手机存储";
+  scope: "pc" | "phone";
   /** The folder the bytes were heading for, as the user knows it. */
   where: string;
   need: number;
@@ -75,8 +75,8 @@ const lastName = (localPath: string) =>
   localPath.slice(Math.max(localPath.lastIndexOf("/"), localPath.lastIndexOf("\\")) + 1);
 
 /** What a stopped transfer says on every row it left behind. `wait_for_transfer`
- *  in src-tauri/src/lib.rs answers with the same text, so the two must match. */
-export const CANCELLED = "已取消。";
+ *  in src-tauri/src/lib.rs answers with the same code, so the two must match. */
+export const CANCELLED = "E#cancelled";
 
 export function useFileOpener() {
   const [copies, setCopies] = useState<Map<string, CachedCopy>>(() => new Map());
@@ -286,7 +286,7 @@ export function useFileOpener() {
         await pullOne(node, "cache", true);
         return;
       }
-      if (!(await roomFor({ scope: "电脑磁盘", need: node.size, items: 1, volume: () => pcVolume("cache"), job: { kind: "cache", node }, force }))) {
+      if (!(await roomFor({ scope: "pc", need: node.size, items: 1, volume: () => pcVolume("cache"), job: { kind: "cache", node }, force }))) {
         return;
       }
       enqueue([{ path: node.path, name: baseName(node.path), size: node.size, done: 0, direction: "open", state: "queued" }]);
@@ -302,7 +302,7 @@ export function useFileOpener() {
       if (todo.length === 0) return 0;
       const need = todo.reduce((sum, node) => sum + node.size, 0);
       const fits = await roomFor({
-        scope: "电脑磁盘",
+        scope: "pc",
         need,
         items: todo.length,
         volume: () => pcVolume("download"),
@@ -355,7 +355,7 @@ export function useFileOpener() {
       const need = [...sizes.values()].reduce((sum, bytes) => sum + bytes, 0);
 
       const fits = await roomFor({
-        scope: "手机存储",
+        scope: "phone",
         need,
         items: paths.length,
         volume: () => phoneVolume(deviceDir),

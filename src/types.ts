@@ -25,9 +25,18 @@ export interface ScanResponse {
 
 export interface Toast {
   id: number;
+  /** A dictionary key, an `E#code` from the Rust side, or plain text from adb. */
   message: string;
+  params?: Record<string, string | number>;
   type: "error" | "success" | "info";
   exiting?: boolean;
 }
 
 export type AppPhase = "setup" | "connecting" | "scanning" | "result";
+
+/** What went wrong, kept as written so it can be re-worded per language. */
+export interface FlowError {
+  message: string;
+  params?: Record<string, string | number>;
+  hints: string[];
+}

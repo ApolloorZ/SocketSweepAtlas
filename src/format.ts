@@ -1,3 +1,5 @@
+import type { Lang } from "./i18n";
+
 export function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -10,15 +12,21 @@ export function formatNumber(n: number): string {
   return n.toLocaleString("en-US");
 }
 
-export function formatDate(seconds: number | undefined): string {
+/**
+ * This year reads as a bare month/day, anything older needs the year. English
+ * uses `Intl` so the month name follows its own conventions instead of being
+ * translated word for word.
+ */
+export function formatDate(seconds: number | undefined, lang: Lang): string {
   if (!seconds) return "—";
   const d = new Date(seconds * 1000);
-  const now = new Date();
-  const sameYear = d.getFullYear() === now.getFullYear();
-  const ymd = sameYear
-    ? `${d.getMonth() + 1}月${d.getDate()}日`
-    : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  return ymd;
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  if (sameYear) {
+    return lang === "zh"
+      ? `${d.getMonth() + 1}月${d.getDate()}日`
+      : d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  }
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
 export function percent(part: number, whole: number): string {

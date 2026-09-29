@@ -33,6 +33,19 @@ static SCAN_ROOT: Mutex<Option<String>> = Mutex::new(None);
 /// Tracks the serial of the connected device so all ADB calls target the right device.
 static DEVICE_SERIAL: Mutex<Option<String>> = Mutex::new(None);
 
+// ── Messages the front end words ────────────────────────────────────────────
+// Anything the user is meant to read travels as `E#code` or `E#code#argument`.
+// The wording itself lives in src/messages.ts in both languages, so the text can
+// follow the language the user picked instead of being frozen here.
+
+pub(crate) fn err(code: &str) -> String {
+    format!("E#{code}")
+}
+
+pub(crate) fn err_arg(code: &str, arg: impl std::fmt::Display) -> String {
+    format!("E#{code}#{arg}")
+}
+
 // ── Resource Resolution ─────────────────────────────────────────────────────
 
 use tauri::Manager;
@@ -212,7 +225,7 @@ fn init_daemon(app: tauri::AppHandle, serial: Option<String>) -> Result<String, 
         Some(requested) => match available.iter().find(|(s, _)| s == &requested) {
             Some((_, status)) if status == "device" => requested,
             Some((_, status)) => {
-                return Err(format!("设备 {requested} 当前状态是「{status}」,还不能用。"))
+                return Err(err_arg("device_status", format!("{requested} ({status})")))
             }
             None => {
                 // A wireless phone re-registers under a new name whenever its IP or
@@ -224,7 +237,7 @@ fn init_daemon(app: tauri::AppHandle, serial: Option<String>) -> Result<String, 
                     .map(|(serial, _)| serial.clone());
                 match (usable.next(), usable.next()) {
                     (Some(only), None) => only,
-                    _ => return Err(format!("没有找到设备 {requested},请重新连接一次。")),
+                    _ => return Err(err_arg("device_gone", requested)),
                 }
             }
         },
@@ -426,7 +439,7 @@ fn free_remote_name(adb_path: &std::path::Path, dir: &str, name: &str) -> Result
         }
         index += 1;
         if index > 50 {
-            return Err("同名文件太多,没能找到可用的文件名。".into());
+            return Err(err("too_many_names"));
         }
     }
 }
@@ -450,19 +463,19 @@ fn local_file_sizes(paths: Vec<String>) -> Result<String, String> {
 fn push_file(app: tauri::AppHandle, local_path: String, device_dir: String) -> Result<String, String> {
     let adb_path = get_bundled_binary(&app, "adb")?;
     if !device_dir.starts_with("/sdcard") {
-        return Err("只能上传到手机 /sdcard 下的目录。".into());
+        return Err(err("upload_outside_sdcard"));
     }
     let source = std::path::PathBuf::from(&local_path);
-    let meta = std::fs::metadata(&source).map_err(|e| format!("读不到这个文件:{e}"))?;
+    let meta = std::fs::metadata(&source).map_err(|e| err_arg("local_stat_failed", e))?;
     if !meta.is_file() {
-        return Err("只能上传单个文件,文件夹请先打包。".into());
+        return Err(err("upload_not_file"));
     }
     let size = meta.len() as i64;
     let dir = device_dir.trim_end_matches('/');
     let raw = source
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| "文件名无法识别。".to_string())?;
+        .ok_or_else(|| err("name_unreadable"))?;
     let target = free_remote_name(&adb_path, dir, &safe_remote_name(raw))?;
     let remote = format!("{dir}/{target}");
 
@@ -482,7 +495,7 @@ fn push_file(app: tauri::AppHandle, local_path: String, device_dir: String) -> R
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| format!("上传没能启动:{e}"))?;
+        .map_err(|e| err_arg("push_start_failed", e))?;
 
     let pushed = wait_for_transfer(
         &app,
@@ -490,7 +503,7 @@ fn push_file(app: tauri::AppHandle, local_path: String, device_dir: String) -> R
         "push-progress",
         &local_path,
         size,
-        "上传",
+        "push",
         &|| {
             let probe = format!("stat -c %s {} 2>/dev/null", shell_quote(&remote));
             device_shell(&adb_path, probe)
@@ -521,7 +534,7 @@ fn move_items(app: tauri::AppHandle, paths: Vec<String>, dest: String) -> Result
     let adb_path = get_bundled_binary(&app, "adb")?;
     let dest = dest.trim_end_matches('/').to_string();
     if !dest.starts_with("/sdcard") || dest.is_empty() {
-        return Err("只能移动到 /sdcard 下的目录。".into());
+        return Err(err("move_outside_sdcard"));
     }
 
     let mut moved: Vec<serde_json::Value> = Vec::new();
@@ -532,21 +545,21 @@ fn move_items(app: tauri::AppHandle, paths: Vec<String>, dest: String) -> Result
         let name = match source.rsplit_once('/') {
             Some((_, tail)) if !tail.is_empty() => tail.to_string(),
             _ => {
-                failed.push(format!("{source}:文件名无法识别"));
+                failed.push(err_arg("move_name_unreadable", source));
                 continue;
             }
         };
         if !source.starts_with("/sdcard/") || source == "/sdcard" {
-            failed.push(format!("{source}:不在 /sdcard 下"));
+            failed.push(err_arg("move_outside_sdcard_item", source));
             continue;
         }
         if source == dest {
-            failed.push(format!("{source}:已经在目标目录里"));
+            failed.push(err_arg("move_already_there", source));
             continue;
         }
         // Moving a folder into one of its own children would take it with us.
         if dest.starts_with(&format!("{source}/")) {
-            failed.push(format!("{source}:不能移动到自己的子目录里"));
+            failed.push(err_arg("move_into_itself", source));
             continue;
         }
 
@@ -554,7 +567,7 @@ fn move_items(app: tauri::AppHandle, paths: Vec<String>, dest: String) -> Result
         let probe = format!("test -e {} && echo TAKEN || echo FREE", shell_quote(&target));
         match device_shell(&adb_path, probe) {
             Ok(answer) if answer.contains("TAKEN") => {
-                failed.push(format!("{name}:目标目录里已经有同名文件,已跳过"));
+                failed.push(err_arg("move_name_taken", name));
                 continue;
             }
             Err(err) => {
@@ -571,7 +584,7 @@ fn move_items(app: tauri::AppHandle, paths: Vec<String>, dest: String) -> Result
                 "to": target,
                 "name": name,
             })),
-            Ok(_) => failed.push(format!("{name}:手机拒绝了这次移动")),
+            Ok(_) => failed.push(err_arg("move_refused", name)),
             Err(err) => failed.push(format!("{name}:{err}")),
         }
     }
@@ -672,10 +685,10 @@ fn pair_device(app: tauri::AppHandle, target: String, code: String) -> Result<St
     let adb_path = get_bundled_binary(&app, "adb")?;
     let code = code.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
     if code.len() != 6 {
-        return Err("配对码是手机上显示的那 6 位数字。".into());
+        return Err(err("pair_code_length"));
     }
     if !target.contains(':') {
-        return Err("请填写“IP:端口”,用无线调试配对界面上显示的那个地址。".into());
+        return Err(err("pair_target_format"));
     }
     adb(&adb_path, &["pair", target.trim(), &code])
 }
@@ -685,7 +698,7 @@ fn connect_device(app: tauri::AppHandle, target: String) -> Result<String, Strin
     let adb_path = get_bundled_binary(&app, "adb")?;
     let target = target.trim().to_string();
     if target.is_empty() {
-        return Err("请填写手机“无线调试”页面上显示的 IP:端口。".into());
+        return Err(err("connect_target_format"));
     }
     adb(&adb_path, &["connect", &target])
 }
@@ -729,21 +742,21 @@ fn default_root(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
 
 fn ensure_dir(path: std::path::PathBuf, label: &str) -> Result<std::path::PathBuf, String> {
     std::fs::create_dir_all(&path)
-        .map_err(|e| format!("无法创建{label}文件夹 {path:?}:{e}"))?;
+        .map_err(|e| err_arg(&format!("dir_create_failed_{label}"), format!("{path:?} — {e}")))?;
     Ok(path)
 }
 
 fn cache_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     match configured(&CACHE_PATH) {
-        Some(path) => ensure_dir(path, "缓存"),
-        None => ensure_dir(default_root(app)?, "缓存"),
+        Some(path) => ensure_dir(path, "cache"),
+        None => ensure_dir(default_root(app)?, "cache"),
     }
 }
 
 fn download_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     match configured(&DOWNLOAD_PATH) {
-        Some(path) => ensure_dir(path, "下载"),
-        None => ensure_dir(default_root(app)?.join("downloads"), "下载"),
+        Some(path) => ensure_dir(path, "download"),
+        None => ensure_dir(default_root(app)?.join("downloads"), "download"),
     }
 }
 
@@ -783,27 +796,27 @@ fn pick(
     let Some(value) = value else { return Ok(()) };
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        *slot.lock().map_err(|_| format!("{label}设置无法保存"))? = None;
+        *slot.lock().map_err(|_| err("path_lock"))? = None;
         return Ok(());
     }
     // The folder gets swept by the cap and by clear-on-exit, so refuse the places
     // where that would be a catastrophe and refuse folders holding other things.
     let candidate = std::path::PathBuf::from(trimmed);
     if candidate.parent().is_none() {
-        return Err(format!("不能把盘符根目录当{label}位置,请在里面新建一个子文件夹。"));
+        return Err(err(&format!("path_is_drive_root_{label}")));
     }
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
     if !home.as_os_str().is_empty() && candidate == home {
-        return Err(format!("不能把用户主目录当{label}位置,请在里面选一个子文件夹。"));
+        return Err(err(&format!("path_is_home_{label}")));
     }
     ensure_dir(candidate.clone(), label)?;
     if must_be_empty && cache_dir_has_foreign_files(&candidate) {
-        return Err(format!("{label}位置必须是空文件夹:里面的文件会被自动清理,请新建一个或先清空。"));
+        return Err(err(&format!("path_not_empty_{label}")));
     }
-    *slot.lock().map_err(|_| format!("{label}设置无法保存"))? = Some(candidate);
+    *slot.lock().map_err(|_| err("path_lock"))? = Some(candidate);
     Ok(())
 }
 
@@ -816,8 +829,8 @@ fn set_paths(
     download: Option<String>,
     clear_on_exit: Option<bool>,
 ) -> Result<String, String> {
-    pick(&CACHE_PATH, cache, "缓存", true)?;
-    pick(&DOWNLOAD_PATH, download, "下载", false)?;
+    pick(&CACHE_PATH, cache, "cache", true)?;
+    pick(&DOWNLOAD_PATH, download, "download", false)?;
     if let Some(flag) = clear_on_exit {
         CLEAR_CACHE_ON_EXIT.store(flag, Ordering::Relaxed);
     }
@@ -1012,7 +1025,7 @@ fn volume_free(path: &std::path::Path) -> Option<u64> {
 #[tauri::command(async)]
 fn disk_free(app: tauri::AppHandle, kind: String) -> Result<String, String> {
     let dir = dir_for(&app, &kind)?;
-    let free = volume_free(&dir).ok_or_else(|| format!("读不到 {} 所在磁盘的剩余空间", dir.display()))?;
+    let free = volume_free(&dir).ok_or_else(|| err_arg("disk_free_unreadable", dir.display().to_string()))?;
     Ok(serde_json::json!({ "path": dir.to_string_lossy(), "free": free }).to_string())
 }
 
@@ -1078,7 +1091,7 @@ fn wait_for_transfer(
             if let Some(path) = partial {
                 let _ = std::fs::remove_file(path);
             }
-            return Err("已取消。".into());
+            return Err(err("cancelled"));
         }
         let done = probe();
         let _ = app.emit(
@@ -1089,12 +1102,12 @@ fn wait_for_transfer(
     }
     let status = child
         .wait()
-        .map_err(|e| format!("{what}没能正常结束:{e}"))?;
+        .map_err(|e| err_arg(&format!("{what}_wait_failed"), e))?;
     if !status.success() {
         if let Some(path) = partial {
             let _ = std::fs::remove_file(path);
         }
-        return Err(format!("{what}失败,手机或数据线可能中途断开了。"));
+        return Err(err(&format!("{what}_failed")));
     }
     Ok(())
 }
@@ -1166,7 +1179,7 @@ fn pull_file(
             "pull-progress",
             &device_path,
             size,
-            "拉取",
+            "pull",
             &|| std::fs::metadata(&local).map(|m| m.len() as i64).unwrap_or(0),
             Some(&local),
         )?;
@@ -1188,7 +1201,7 @@ fn pull_file(
     if open {
         app.opener()
             .open_path(&local_str, None::<&str>)
-            .map_err(|e| format!("文件已拉到电脑,但打不开:{}", e))?;
+            .map_err(|e| err_arg("open_after_pull_failed", e))?;
     }
 
     Ok(local_str)
@@ -1204,7 +1217,7 @@ fn reveal_folder(app: tauri::AppHandle, kind: String) -> Result<String, String> 
         .to_string();
     app.opener()
         .open_path(&path, None::<&str>)
-        .map_err(|e| format!("打不开这个文件夹:{e}"))?;
+        .map_err(|e| err_arg("reveal_failed", e))?;
     Ok(path)
 }
 

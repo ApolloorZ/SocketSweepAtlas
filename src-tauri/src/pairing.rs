@@ -14,6 +14,8 @@ use rand::Rng;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
+use crate::{err, err_arg};
+
 const PAIR_SERVICE: &str = "_adb-tls-pairing";
 const CONNECT_SERVICE: &str = "_adb-tls-connect";
 const SCAN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -56,7 +58,7 @@ fn qr_svg(text: &str) -> Result<String, String> {
     use qrcode::{Color, EcLevel, QrCode};
 
     let code = QrCode::with_error_correction_level(text.as_bytes(), EcLevel::M)
-        .map_err(|e| format!("无法生成二维码: {e}"))?;
+        .map_err(|e| err_arg("qr_failed", e))?;
     let width = code.width();
     let colors = code.to_colors();
     let quiet = 4usize;
@@ -145,7 +147,7 @@ fn wait_for_service(
     let started = Instant::now();
     loop {
         if CANCELLED.load(Ordering::Relaxed) {
-            return Err("已取消。".into());
+            return Err(err("cancelled"));
         }
 
         let rows: Vec<MdnsRow> = mdns_services(adb_path)
@@ -185,7 +187,7 @@ fn ensure_mdns(adb_path: &std::path::Path) -> Result<(), String> {
     if mdns_ready(&retried) {
         Ok(())
     } else {
-        Err("这台电脑上的 adb 不支持局域网发现,请更新 platform-tools 后再试。".into())
+        Err(err("mdns_unsupported"))
     }
 }
 
@@ -241,7 +243,7 @@ fn finish_connection(
     let started = Instant::now();
     while started.elapsed() < CONNECT_TIMEOUT {
         if !active() {
-            return Err("已取消。".into());
+            return Err(err("cancelled"));
         }
 
         if let Some(serial) = connected_serials(adb_path)
@@ -282,7 +284,7 @@ fn finish_connection(
     if dial(adb_path, &legacy) {
         return Ok(legacy);
     }
-    Err("配对成功了,但连接没建起来。请在手机上把「无线调试」关掉再打开一次,然后到设备列表里点「一键连接」。".into())
+    Err(err("paired_not_connected"))
 }
 
 #[derive(Clone, Serialize)]
@@ -348,7 +350,7 @@ pub fn start(app: AppHandle) -> Result<(String, String), String> {
         let adb_path = match crate::get_bundled_binary(&app, "adb") {
             Ok(path) => path,
             Err(_) => {
-                report(&app, "error", "找不到自带的 adb,无法完成配对。".into(), None);
+                report(&app, "error", err("qr_no_adb"), None);
                 return;
             }
         };
@@ -361,14 +363,14 @@ pub fn start(app: AppHandle) -> Result<(String, String), String> {
             return;
         }
 
-        report(&app, "waiting", "等待手机扫码…".into(), None);
+        report(&app, "waiting", err("qr_waiting"), None);
         let paired = wait_for_service(
             &adb_path,
             PAIR_SERVICE,
             &|row| row.instance == name,
             SCAN_TIMEOUT,
             Some(SOLO_FALLBACK),
-            "等了五分钟没等到扫码。请确认手机停在「使用二维码配对设备」界面,并且和电脑连着同一个 Wi-Fi。",
+            "E#qr_timeout",
         );
 
         if !active() {
@@ -385,23 +387,23 @@ pub fn start(app: AppHandle) -> Result<(String, String), String> {
         report(
             &app,
             "found",
-            format!("发现手机 {},正在配对…", device.address),
+            err_arg("qr_found", device.address.clone()),
             None,
         );
 
         let pair_target = format!("{}:{}", device.address, device.port);
         let before = connected_serials(&adb_path);
         if let Err(err) = crate::adb(&adb_path, &["pair", &pair_target, &password]) {
-            report(&app, "error", format!("配对失败:{err}"), None);
+            report(&app, "error", err_arg("qr_pair_failed", err), None);
             return;
         }
         if !active() {
             return;
         }
 
-        report(&app, "pairing", "配对成功,正在建立连接…".into(), None);
+        report(&app, "pairing", err("qr_paired"), None);
         match finish_connection(&adb_path, &before, &device.address, &active) {
-            Ok(serial) => report(&app, "connected", format!("已连接 {serial}"), Some(serial)),
+            Ok(serial) => report(&app, "connected", err_arg("qr_connected", serial.clone()), Some(serial)),
             Err(message) => report(&app, "error", message, None),
         }
     });

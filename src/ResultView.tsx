@@ -1,27 +1,28 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { callBackend, isMockMode } from "./backend";
 import { Treemap, ResponsiveContainer, Tooltip as RechartsTooltip } from "recharts";
-import type { Capacity, FileNode, ScanResponse } from "./types";
-import { CATEGORY_LABELS, CATEGORY_ORDER, type Category } from "./categories";
+import type { Capacity, FileNode, FlowError, ScanResponse } from "./types";
+import { CATEGORY_ORDER, categoryLabel, type Category } from "./categories";
 import { breadcrumbs, clearStatsCache, collectCategories, findNode, subtreeStats } from "./tree";
 import { formatBytes, formatDate, formatNumber, percent } from "./format";
 import { TypeGlyph, TypeIcon } from "./icons";
 import { DownloadsPanel } from "./DownloadsPanel";
 import { useFileOpener } from "./opener";
+import { say, useI18n, type Params } from "./i18n";
 
 // ── Sorting ────────────────────────────────────────────────────────────────
 
 type SortKey = "size" | "name" | "mtime";
 interface Sort { key: SortKey; desc: boolean }
 
-function compareNodes(a: FileNode, b: FileNode, sort: Sort, byPath: (n: FileNode) => string): number {
+function compareNodes(a: FileNode, b: FileNode, sort: Sort, locale: string): number {
   // Directories always lead, mirroring how people scan a folder list.
   if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
   const dir = sort.desc ? -1 : 1;
   switch (sort.key) {
     case "size": return (a.size - b.size) * dir;
     case "mtime": return ((a.mtime ?? 0) - (b.mtime ?? 0)) * dir;
-    case "name": return byPath(a).localeCompare(byPath(b), "zh-Hans-CN") * dir;
+    case "name": return a.name.localeCompare(b.name, locale);
   }
 }
 
@@ -44,11 +45,11 @@ const GRID_CATEGORY = "28px minmax(0,1fr) 110px 68px 92px minmax(0,1.2fr) 44px";
 // ── Nothing readable ────────────────────────────────────────────────────────
 
 const EMPTY_SCAN_CHECKLIST = [
-  "手机下拉通知栏 → USB 用途选择“传输文件 (MTP)”,不要选“仅充电”。",
-  "小米 / 红米:开发者选项里额外打开“USB 调试(安全设置)”。",
-  "三星:设置 → 安全 → 关闭“自动阻止”。",
-  "部分手机会在连接后询问是否允许访问内部存储,要点允许。",
-  "以上都确认后可以重试扫描;若仍然为 0,重启手机的 USB 调试开关再连一次。",
+  "empty.1",
+  "empty.2",
+  "empty.3",
+  "empty.4",
+  "empty.5",
 ];
 
 export function EmptyScanScreen({
@@ -58,29 +59,30 @@ export function EmptyScanScreen({
   onRescan: () => void;
   onDisconnect: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="flex-1 min-h-0 overflow-y-auto px-6 py-6 flex flex-col items-center gap-5">
       <div className="text-center max-w-md">
         <div className="text-3xl mb-3">🗂️</div>
-        <h2 className="text-base font-semibold text-zinc-200">扫描完成,但一个文件都没读到</h2>
+        <h2 className="text-base font-semibold text-zinc-200">{t("empty.title")}</h2>
         <p className="mt-1.5 text-sm text-zinc-500 leading-relaxed">
-          这通常不是手机真的空的,而是手机没有把存储访问权交给调试通道。请逐条检查:
+          {t("empty.intro")}
         </p>
       </div>
       <ul className="w-full max-w-md flex flex-col gap-2">
         {EMPTY_SCAN_CHECKLIST.map((item, i) => (
           <li key={i} className="flex gap-2.5 text-sm text-zinc-400 leading-relaxed glass-card rounded-lg px-3 py-2">
             <span className="text-accent-400 font-mono">{i + 1}</span>
-            <span>{item}</span>
+            <span>{t(item)}</span>
           </li>
         ))}
       </ul>
       <div className="flex items-center gap-2">
         <button onClick={onRescan} className="px-4 py-2 rounded-lg text-xs font-semibold bg-gradient-to-r from-accent-600 to-accent-500 text-white hover:from-accent-500 hover:to-accent-400 cursor-pointer">
-          ↻ 重新扫描
+          {t("view.rescan")}
         </button>
         <button onClick={onDisconnect} className="px-4 py-2 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-400 hover:text-zinc-200 border border-zinc-700/50 cursor-pointer">
-          断开连接
+          {t("view.disconnect")}
         </button>
       </div>
     </div>
@@ -186,11 +188,12 @@ export function ResultView({
   onDisconnect: () => void;
   onDeletePaths: (paths: string[]) => Promise<void>;
   onMovePaths: (paths: string[], dest: string) => Promise<void>;
-  notify: (message: string) => void;
+  notify: (message: string, params?: Params) => void;
   onUploaded: (items: { name: string; bytes: number }[], dirPath: string) => void;
-  flowError: { message: string; hints: string[] } | null;
+  flowError: FlowError | null;
   onDismissError: () => void;
 }) {
+  const { t, lang } = useI18n();
   const [view, setView] = useState<View>("home");
   const [browsePath, setBrowsePath] = useState(data.tree.path);
   const [category, setCategory] = useState<Category>("video");
@@ -246,8 +249,8 @@ export function ResultView({
     const filtered = q
       ? source.filter((n) => n.name.toLowerCase().includes(q) || (view === "category" && n.path.toLowerCase().includes(q)))
       : source;
-    return filtered.slice().sort((a, b) => compareNodes(a, b, sort, (n) => n.name));
-  }, [view, buckets, category, currentNode, query, sort]);
+    return filtered.slice().sort((a, b) => compareNodes(a, b, sort, lang === "zh" ? "zh-Hans-CN" : "en"));
+  }, [view, buckets, category, currentNode, query, sort, lang]);
 
   const treemapData = useMemo(() => {
     const kids = (data.tree.children ?? []).filter((c) => c.size > 0).sort((a, b) => b.size - a.size);
@@ -256,10 +259,10 @@ export function ResultView({
     const restSize = rest.reduce((sum, c) => sum + c.size, 0);
     const out = visible.map((c) => ({ name: c.name, size: c.size, path: c.path }));
     if (rest.length > 0) {
-      out.push({ name: `其余 ${formatNumber(rest.length)} 项`, size: restSize, path: data.tree.path });
+      out.push({ name: t("view.restItems", { count: formatNumber(rest.length) }), size: restSize, path: data.tree.path });
     }
     return out;
-  }, [data]);
+  }, [data, t]);
 
   const toggleSort = (key: SortKey) =>
     setSort((prev) => (prev.key === key ? { key, desc: !prev.desc } : { key, desc: true }));
@@ -297,10 +300,10 @@ export function ResultView({
       return;
     }
     const { open } = await import("@tauri-apps/plugin-dialog");
-    const chosen = await open({ multiple: true, title: "选择要上传到手机的文件" });
+    const chosen = await open({ multiple: true, title: t("view.uploadDialogTitle") });
     const paths = Array.isArray(chosen) ? chosen : chosen ? [chosen] : [];
     if (paths.length > 0) await runUpload(paths);
-  }, [runUpload]);
+  }, [runUpload, t]);
 
   // Tauri owns drag and drop in the webview, so dropped paths arrive as a window
   // event rather than a DOM one; the mock build has nothing to drop.
@@ -475,6 +478,7 @@ export function ResultView({
   );
 
   const grid = view === "category" ? GRID_CATEGORY : GRID_BROWSE;
+  const space = opener.pendingSpace;
 
   return (
     <div className="flex flex-col h-full min-h-0 animate-fade-in-up">
@@ -485,7 +489,7 @@ export function ResultView({
             onClick={() => { setView("home"); setSelected(new Map()); setQuery(""); }}
             className="px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 cursor-pointer"
           >
-            ← 返回总览
+            {t("view.backHome")}
           </button>
         )}
         {view === "home" && (
@@ -497,20 +501,20 @@ export function ResultView({
         <div className="flex items-center gap-3 text-xs min-w-0 flex-1 overflow-hidden">
           {capacity ? (
             <>
-              <span className="text-zinc-500 shrink-0">总容量 <span className="text-zinc-200 font-mono">{formatBytes(capacity.total_bytes)}</span></span>
-              <span className="text-zinc-500 shrink-0">已用 <span className="text-zinc-200 font-mono">{formatBytes(capacity.used_bytes)}</span></span>
-              <span className="text-zinc-500 shrink-0">剩余 <span className="text-emerald-400 font-mono">{formatBytes(capacity.free_bytes)}</span></span>
+              <span className="text-zinc-500 shrink-0">{t("view.capacityTotal")} <span className="text-zinc-200 font-mono">{formatBytes(capacity.total_bytes)}</span></span>
+              <span className="text-zinc-500 shrink-0">{t("view.capacityUsed")} <span className="text-zinc-200 font-mono">{formatBytes(capacity.used_bytes)}</span></span>
+              <span className="text-zinc-500 shrink-0">{t("view.capacityFree")} <span className="text-emerald-400 font-mono">{formatBytes(capacity.free_bytes)}</span></span>
               <div className="flex-1 min-w-8 max-w-[220px]"><SizeBar ratio={capacity.used_bytes / capacity.total_bytes} /></div>
               <span className="text-zinc-400 font-mono shrink-0">{percent(capacity.used_bytes, capacity.total_bytes)}</span>
             </>
           ) : (
-            <span className="text-zinc-600 shrink-0">读不到手机容量信息,占比按已扫描总量计算</span>
+            <span className="text-zinc-600 shrink-0">{t("view.noCapacity")}</span>
           )}
-          <span className="text-zinc-600 shrink-0 ml-auto">扫描到 {formatNumber(data.total_files)} 个文件 · {formatBytes(data.total_size)}</span>
+          <span className="text-zinc-600 shrink-0 ml-auto">{t("view.scanned", { count: formatNumber(data.total_files), size: formatBytes(data.total_size) })}</span>
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
-          <IconButton id="btn-downloads" label="下载" onClick={() => setDownloadsOpen(true)}>
+          <IconButton id="btn-downloads" label={t("transfer.title")} onClick={() => setDownloadsOpen(true)}>
             <IconDownload />
             {opener.queue.some((item) => item.state === "active" || item.state === "queued") && (
               <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full bg-accent-500 text-white text-[10px] font-mono flex items-center justify-center">
@@ -518,10 +522,10 @@ export function ResultView({
               </span>
             )}
           </IconButton>
-          <IconButton id="btn-rescan" label="重新扫描" onClick={onRescan}>
+          <IconButton id="btn-rescan" label={t("view.rescanShort")} onClick={onRescan}>
             <IconRescan />
           </IconButton>
-          <IconButton id="btn-disconnect" label="断开连接" onClick={onDisconnect} danger>
+          <IconButton id="btn-disconnect" label={t("view.disconnect")} onClick={onDisconnect} danger>
             <IconDisconnect />
           </IconButton>
         </div>
@@ -534,8 +538,8 @@ export function ResultView({
             id="btn-up"
             onClick={() => parentPath && openFolder(parentPath)}
             disabled={!parentPath}
-            title={parentPath ? "返回上一级" : "已经在根目录"}
-            aria-label="返回上一级"
+            title={parentPath ? t("view.up") : t("view.atRoot")}
+            aria-label={t("view.up")}
             className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 border border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 disabled:opacity-35 disabled:cursor-not-allowed cursor-pointer"
           >
             <IconBack />
@@ -554,8 +558,8 @@ export function ResultView({
       )}
       {view === "category" && (
         <div className="px-5 py-2 border-b border-zinc-800/60 shrink-0 text-sm flex items-center gap-2">
-          <span className="font-mono text-zinc-100 font-semibold">{CATEGORY_LABELS[category]}</span>
-          <span className="text-xs text-zinc-600">全部目录汇总</span>
+          <span className="font-mono text-zinc-100 font-semibold">{categoryLabel(t, category)}</span>
+          <span className="text-xs text-zinc-600">{t("view.everyFolder")}</span>
         </div>
       )}
 
@@ -566,10 +570,10 @@ export function ResultView({
               <div className="flex items-start gap-2.5">
                 <span className="text-danger-400 text-sm mt-0.5">✕</span>
                 <div className="flex-1 min-w-0">
-                  <p className="text-sm text-zinc-300 leading-relaxed break-words">{flowError.message}</p>
-                  {flowError.hints.map((h, i) => <p key={i} className="text-xs text-zinc-500 mt-1">· {h}</p>)}
+                  <p className="text-sm text-zinc-300 leading-relaxed break-words">{say(t, flowError.message, flowError.params)}</p>
+                  {flowError.hints.map((h, i) => <p key={i} className="text-xs text-zinc-500 mt-1">· {say(t, h)}</p>)}
                 </div>
-                <button onClick={onDismissError} className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer">知道了</button>
+                <button onClick={onDismissError} className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer">{t("common.known")}</button>
               </div>
             </div>
           </div>
@@ -583,10 +587,10 @@ export function ResultView({
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={view === "category" ? "搜索文件名或所在目录…" : "搜索当前目录…"}
+            placeholder={t(view === "category" ? "view.searchCategory" : "view.searchFolder")}
             className="w-64 max-w-[40%] shrink-0 bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-1.5 text-sm text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-accent-500/50"
           />
-          <span className="text-xs text-zinc-600 shrink-0">{formatNumber(rows.length)} 项</span>
+          <span className="text-xs text-zinc-600 shrink-0">{t("view.items", { count: formatNumber(rows.length) })}</span>
           <div className="flex-1 min-w-0 flex items-center gap-2">
             {opener.pull && (
               <>
@@ -605,10 +609,10 @@ export function ResultView({
               <button
                 id="btn-cancel-transfer"
                 onClick={opener.cancelTransfer}
-                title="停止当前传输:半途的文件不会留在电脑上或手机上"
+                title={t("transfer.cancelNote")}
                 className="ml-auto px-2.5 py-1 rounded-md text-[11px] font-medium text-zinc-400 hover:text-zinc-100 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700/50 cursor-pointer shrink-0"
               >
-                取消传输
+                {t("transfer.cancel")}
               </button>
             )}
           </div>
@@ -616,26 +620,26 @@ export function ResultView({
             <button
               id="btn-select-all"
               onClick={toggleSelectAll}
-              title={allSelected ? "取消当前列出的选择" : `选中当前列出的 ${formatNumber(rows.length)} 项`}
+              title={t(allSelected ? "view.deselectListed" : "view.selectListed", { count: formatNumber(rows.length) })}
               className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer shrink-0"
             >
-              {allSelected ? "取消全选" : "全选"}
+              {t(allSelected ? "view.deselectAll" : "view.selectAll")}
             </button>
           )}
           {selected.size > 0 && (
             <button onClick={() => { setSelected(new Map()); setMoving(false); }} className="text-xs text-zinc-500 hover:text-zinc-300 cursor-pointer shrink-0">
-              取消选择
+              {t("view.clearSelection")}
             </button>
           )}
           {view === "browse" && (
             <button
               id="btn-upload"
               onClick={() => void pickUpload()}
-              title={`上传文件到 ${browsePath}`}
+              title={t("view.uploadTo", { path: browsePath })}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 hover:text-zinc-100 border border-zinc-700/50 cursor-pointer shrink-0"
             >
               <IconUpload />
-              上传
+              {t("view.upload")}
             </button>
           )}
         </div>
@@ -646,7 +650,7 @@ export function ResultView({
           <div className="px-5 py-4 flex flex-col gap-4">
             {/* ① Treemap of level-1 folders */}
             <section>
-              <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">一级目录占用</h2>
+              <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">{t("view.treemapTitle")}</h2>
               <div className="glass-card rounded-xl p-2 h-52">
                 <ResponsiveContainer width="100%" height="100%">
                   <Treemap
@@ -664,8 +668,8 @@ export function ResultView({
                         return (
                           <div className="bg-zinc-900 border border-zinc-800 p-2 rounded shadow-xl text-xs">
                             <p className="font-semibold text-zinc-200">{p.name}</p>
-                            <p className="text-zinc-400 font-mono mt-1">{formatBytes(p.size)} · 占整块盘 {percent(p.size, denominator)}</p>
-                            <p className="text-zinc-600 mt-1">点击进入该目录</p>
+                            <p className="text-zinc-400 font-mono mt-1">{t("view.ofDisk", { size: formatBytes(p.size), pct: percent(p.size, denominator) })}</p>
+                            <p className="text-zinc-600 mt-1">{t("view.treemapHint")}</p>
                           </div>
                         );
                       }}
@@ -677,7 +681,7 @@ export function ResultView({
 
             {/* ② Category cards */}
             <section>
-              <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">按类型统计</h2>
+              <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-2">{t("view.byType")}</h2>
               <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
                 {CATEGORY_ORDER.map((key) => {
                   const bucket = buckets.get(key)!;
@@ -690,12 +694,12 @@ export function ResultView({
                       <div className="flex items-center justify-between gap-2">
                         <span className="flex items-center gap-2">
                           <TypeGlyph kind={key === "other" ? "unknown" : key} size={22} />
-                          <span className="text-sm text-zinc-300">{CATEGORY_LABELS[key]}</span>
+                          <span className="text-sm text-zinc-300">{categoryLabel(t, key)}</span>
                         </span>
-                        <span className="text-[11px] text-zinc-600 font-mono group-hover:text-accent-400">查看 →</span>
+                        <span className="text-[11px] text-zinc-600 font-mono group-hover:text-accent-400">{t("view.open")}</span>
                       </div>
                       <div className="mt-1 text-lg font-bold font-mono text-zinc-100">{formatBytes(bucket.size)}</div>
-                      <div className="text-[11px] text-zinc-600 font-mono">{formatNumber(bucket.files.length)} 个文件 · 占整块盘 {percent(bucket.size, denominator)}</div>
+                      <div className="text-[11px] text-zinc-600 font-mono">{t("view.typeStat", { count: formatNumber(bucket.files.length), pct: percent(bucket.size, denominator) })}</div>
                       <div className="mt-2"><SizeBar ratio={bucket.size / (denominator || 1)} /></div>
                     </button>
                   );
@@ -711,9 +715,9 @@ export function ResultView({
               >
                 <TypeGlyph kind="folder" size={40} />
                 <span className="flex-1">
-                  <span className="block text-sm font-semibold text-zinc-200">所有文件</span>
+                  <span className="block text-sm font-semibold text-zinc-200">{t("view.allFiles")}</span>
                   <span className="block text-xs text-zinc-500 mt-0.5">
-                    按目录逐层查看 · 单击勾选 · 双击拉到电脑上打开
+                    {t("view.allFilesNote")}
                   </span>
                 </span>
                 <span className="text-2xl font-bold font-mono text-accent-400">{formatBytes(data.total_size)}</span>
@@ -727,16 +731,16 @@ export function ResultView({
           <div className="px-5 py-3">
             <div className="grid items-center gap-3 px-3 py-2 border-b border-zinc-800/80 sticky top-0 bg-surface-0/95 backdrop-blur" style={{ gridTemplateColumns: grid }}>
               <span />
-              {headerCell("名称")}
-              {headerCell("大小", "size")}
-              {headerCell("占比")}
-              {view === "browse" ? headerCell("文件/文件夹") : headerCell("修改时间", "mtime")}
-              {view === "browse" ? headerCell("修改时间", "mtime") : headerCell("所在目录")}
+              {headerCell(t("col.name"))}
+              {headerCell(t("col.size"), "size")}
+              {headerCell(t("col.share"))}
+              {view === "browse" ? headerCell(t("col.counts")) : headerCell(t("col.mtime"), "mtime")}
+              {view === "browse" ? headerCell(t("col.mtime"), "mtime") : headerCell(t("col.where"))}
               <span />
             </div>
 
             {rows.length === 0 && (
-              <p className="text-sm text-zinc-600 py-8 text-center">没有匹配的项目</p>
+              <p className="text-sm text-zinc-600 py-8 text-center">{t("view.noMatches")}</p>
             )}
 
             {rows.slice(0, shown).map((node) => {
@@ -750,7 +754,7 @@ export function ResultView({
                   data-path={node.path}
                   onClick={() => (isDir ? openFolder(node.path) : toggleSelected(node))}
                   onDoubleClick={() => !isDir && opener.openFile(node)}
-                  title={isDir ? "单击进入该目录" : "单击勾选,双击拉到电脑上打开"}
+                  title={t(isDir ? "row.dirHint" : "row.fileHint")}
                   className={`grid items-center gap-3 px-3 py-1.5 rounded-md file-row cursor-pointer ${checked ? "bg-accent-500/10" : ""} ${moving && checked ? "opacity-35" : ""}`}
                   style={{ gridTemplateColumns: grid }}
                 >
@@ -760,7 +764,7 @@ export function ResultView({
                       <span className="truncate">{node.name}</span>
                       {cached && (
                         <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/25 shrink-0">
-                          已缓存
+                          {t("row.cached")}
                         </span>
                       )}
                     </div>
@@ -775,9 +779,9 @@ export function ResultView({
                   <span className="text-xs font-mono text-zinc-500">{percent(node.size, denominator)}</span>
                   {view === "browse"
                     ? <span className="text-xs font-mono text-zinc-500">{stats ? `${formatNumber(stats.files)} / ${formatNumber(stats.dirs)}` : ""}</span>
-                    : <span className="text-xs font-mono text-zinc-500">{formatDate(node.mtime)}</span>}
+                    : <span className="text-xs font-mono text-zinc-500">{formatDate(node.mtime, lang)}</span>}
                   {view === "browse"
-                    ? <span className="text-xs font-mono text-zinc-500">{formatDate(node.mtime)}</span>
+                    ? <span className="text-xs font-mono text-zinc-500">{formatDate(node.mtime, lang)}</span>
                     : (
                       <span className="text-xs text-zinc-600 truncate" title={node.path}>
                         {node.path.slice(0, node.path.lastIndexOf("/"))}
@@ -786,7 +790,7 @@ export function ResultView({
                   <span
                     onPointerDown={(e) => startPaint(node, e)}
                     onClick={(e) => e.stopPropagation()}
-                    title={checked ? "取消选择(按住拖动可连续取消)" : "选择这一项(按住拖动可连续选择)"}
+                    title={t(checked ? "row.uncheckHint" : "row.checkHint")}
                     className="h-10 -my-2 flex items-center justify-center rounded-md cursor-pointer hover:bg-zinc-700/40 touch-none select-none"
                   >
                     <input
@@ -806,7 +810,7 @@ export function ResultView({
                 onClick={() => setShown((s) => s + 500)}
                 className="w-full py-3 text-xs text-accent-400 hover:text-accent-300 cursor-pointer"
               >
-                已显示 {formatNumber(shown)} / {formatNumber(rows.length)} 项 · 加载更多
+                {t("view.loadMore", { shown: formatNumber(shown), total: formatNumber(rows.length) })}
               </button>
             )}
           </div>
@@ -818,31 +822,31 @@ export function ResultView({
         <div className="shrink-0 border-t border-zinc-800 bg-zinc-900/95 backdrop-blur px-5 py-3 flex items-center gap-4">
           {moving ? (
             <>
-              <span className="text-sm text-accent-300 shrink-0">把 {selected.size} 项移动到</span>
+              <span className="text-sm text-accent-300 shrink-0">{t("sel.moveTo", { count: selected.size })}</span>
               <span className="text-sm font-mono text-zinc-200 truncate flex-1 min-w-0" title={browsePath}>{browsePath}</span>
-              <span className="text-[11px] text-zinc-600 shrink-0">同名文件不会被覆盖</span>
+              <span className="text-[11px] text-zinc-600 shrink-0">{t("sel.noOverwrite")}</span>
               <div className="flex items-center gap-2 shrink-0">
                 <button
                   onClick={() => setMoving(false)}
                   className="px-4 py-2 rounded-lg text-sm font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 cursor-pointer"
                 >
-                  取消
+                  {t("common.cancel")}
                 </button>
                 <button
                   id="btn-move-here"
                   onClick={() => void confirmMove()}
                   className="px-4 py-2 rounded-lg text-sm font-bold bg-gradient-to-r from-accent-600 to-accent-500 text-white hover:from-accent-500 hover:to-accent-400 cursor-pointer"
                 >
-                  移动到此处
+                  {t("sel.moveHere")}
                 </button>
               </div>
             </>
           ) : (
             <>
-              <span className="text-sm text-zinc-300">已选 <span className="font-mono text-accent-400">{selected.size}</span> 项</span>
-              <span className="text-sm text-zinc-500">合计 <span className="font-mono text-zinc-200">{formatBytes(selectedSize)}</span></span>
+              <span className="text-sm text-zinc-300">{t("sel.countPrefix")} <span className="font-mono text-accent-400">{selected.size}</span> {t("sel.countSuffix")}</span>
+              <span className="text-sm text-zinc-500">{t("sel.total")} <span className="font-mono text-zinc-200">{formatBytes(selectedSize)}</span></span>
               {selectedFiles.length > 0 && (
-                <span className="text-xs text-zinc-600">其中 {selectedFiles.length} 个文件可下载</span>
+                <span className="text-xs text-zinc-600">{t("sel.downloadable", { count: selectedFiles.length })}</span>
               )}
               <div className="ml-auto flex items-center gap-2">
                 <button
@@ -854,26 +858,26 @@ export function ResultView({
                     setSelected(new Map());
                   }}
                   disabled={selectedFiles.length === 0 || opener.busy}
-                  title={selectedFiles.length === 0 ? "所选里没有可下载的文件(文件夹不能直接下载)" : "把所选文件拉到电脑的下载文件夹,保留原文件名,不自动打开"}
+                  title={t(selectedFiles.length === 0 ? "sel.noneDownloadable" : "sel.downloadHint")}
                   className="px-4 py-2 rounded-lg text-sm font-semibold bg-zinc-800 text-accent-400 border border-accent-500/30 hover:bg-zinc-700 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
                 >
-                  {opener.busy ? "正在传输…" : "⬇ 下载所选"}
+                  {opener.busy ? t("sel.transferring") : t("sel.download")}
                 </button>
                 {view === "browse" && (
                   <button
                     id="btn-move"
                     onClick={() => setMoving(true)}
-                    title="选好后再进入目标文件夹,点「移动到此处」;手机上的同名文件不会被覆盖"
+                    title={t("sel.moveHint")}
                     className="px-4 py-2 rounded-lg text-sm font-semibold bg-zinc-800 text-zinc-200 border border-zinc-700 hover:bg-zinc-700 cursor-pointer"
                   >
-                    → 移动
+                    {t("sel.move")}
                   </button>
                 )}
                 <button
                   onClick={() => setConfirming(true)}
                   className="px-4 py-2 rounded-lg text-sm font-bold bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-500/20 cursor-pointer"
                 >
-                  删除所选
+                  {t("sel.delete")}
                 </button>
               </div>
             </>
@@ -883,48 +887,44 @@ export function ResultView({
 
       {/* The volume cannot hold what is about to be transferred, so ask first.
           Above the transfer panel (z-110), which opens in the same gesture. */}
-      {opener.pendingSpace && (
+      {space && (
         <div className="fixed inset-0 z-[130] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
           <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 max-w-lg w-full shadow-2xl animate-fade-in-up">
             <h3 className="text-lg font-bold text-zinc-100 mb-1">
-              {opener.pendingSpace.scope}放不下这一批
+              {t("space.title", { scope: t(space.scope === "pc" ? "space.pc" : "space.phone") })}
             </h3>
             <p className="text-sm text-zinc-500 mb-4 leading-relaxed">
-              {opener.pendingSpace.scope === "电脑磁盘"
-                ? "传输前查了一下目标文件夹所在的盘,剩余空间不够。硬拉会在中途失败并留下半个文件。"
-                : "上传前查了一下手机的剩余空间。存储被写满时手机上的应用会立刻出问题,所以先停下来问一句。"}
+              {t(space.scope === "pc" ? "space.pcNote" : "space.phoneNote")}
             </p>
             <dl className="rounded-lg border border-zinc-800 bg-zinc-950 divide-y divide-zinc-800/70 text-sm mb-4">
               <div className="flex gap-3 px-3 py-2">
-                <dt className="w-24 shrink-0 text-zinc-600">需要</dt>
+                <dt className="w-24 shrink-0 text-zinc-600">{t("space.need")}</dt>
                 <dd className="text-zinc-200 font-mono">
-                  {formatBytes(opener.pendingSpace.need)}
-                  <span className="text-zinc-600 text-xs ml-2">({opener.pendingSpace.items} 个文件)</span>
+                  {formatBytes(space.need)}
+                  <span className="text-zinc-600 text-xs ml-2">{t("space.items", { count: space.items })}</span>
                 </dd>
               </div>
               <div className="flex gap-3 px-3 py-2">
-                <dt className="w-24 shrink-0 text-zinc-600">{opener.pendingSpace.scope}剩余</dt>
-                <dd className="text-danger-400 font-mono">{formatBytes(opener.pendingSpace.free)}</dd>
+                <dt className="w-24 shrink-0 text-zinc-600">{t(space.scope === "pc" ? "space.freePc" : "space.freePhone")}</dt>
+                <dd className="text-danger-400 font-mono">{formatBytes(space.free)}</dd>
               </div>
               <div className="flex gap-3 px-3 py-2">
-                <dt className="w-24 shrink-0 text-zinc-600">目标位置</dt>
-                <dd className="text-zinc-300 font-mono text-xs break-all">{opener.pendingSpace.where}</dd>
+                <dt className="w-24 shrink-0 text-zinc-600">{t("space.where")}</dt>
+                <dd className="text-zinc-300 font-mono text-xs break-all">{space.where}</dd>
               </div>
             </dl>
             <p className="text-xs text-zinc-500 leading-relaxed mb-5">
-              {opener.pendingSpace.scope === "电脑磁盘"
-                ? "可以先在「设置」里把缓存/下载位置换到空间更大的盘,或者少选几个文件。"
-                : "可以先在手机上腾出空间,或者少选几个文件。"}
+              {t(space.scope === "pc" ? "space.pcFix" : "space.phoneFix")}
             </p>
             <div className="flex items-center gap-3 justify-end">
               <button onClick={opener.cancelSpace} className="px-4 py-2 rounded-lg text-sm font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 cursor-pointer">
-                取消 (Esc)
+                {t("common.cancelEsc")}
               </button>
               <button
                 onClick={opener.confirmSpace}
                 className="px-4 py-2 rounded-lg text-sm font-semibold bg-zinc-800 text-zinc-200 border border-zinc-700 hover:bg-zinc-700 cursor-pointer"
               >
-                仍然尝试
+                {t("common.tryAnyway")}
               </button>
             </div>
           </div>
@@ -934,9 +934,9 @@ export function ResultView({
       {dragging && (
         <div className="pointer-events-none fixed inset-0 z-[95] flex items-center justify-center bg-black/55 backdrop-blur-[2px]">
           <div className="rounded-2xl border-2 border-dashed border-accent-500/70 bg-zinc-900/95 px-8 py-6 text-center shadow-2xl">
-            <p className="text-sm font-semibold text-zinc-100">松手即上传到当前目录</p>
+            <p className="text-sm font-semibold text-zinc-100">{t("drop.title")}</p>
             <p className="mt-1.5 text-xs text-zinc-400 font-mono break-all max-w-md">{browsePath}</p>
-            <p className="mt-2 text-[11px] text-zinc-600">同名文件不会被覆盖,会自动加 (2)、(3)</p>
+            <p className="mt-2 text-[11px] text-zinc-600">{t("drop.note")}</p>
           </div>
         </div>
       )}
@@ -957,10 +957,10 @@ export function ResultView({
           <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 max-w-lg w-full shadow-2xl animate-fade-in-up">
             <div className="flex items-center gap-3 mb-4">
               <div className="w-10 h-10 rounded-full bg-red-500/10 flex items-center justify-center text-red-500 text-sm">🗑</div>
-              <h3 className="text-lg font-bold text-zinc-100">确认删除这 {selected.size} 项?</h3>
+              <h3 className="text-lg font-bold text-zinc-100">{t("confirm.title", { count: selected.size })}</h3>
             </div>
             <p className="text-sm text-zinc-400 mb-3 leading-relaxed">
-              删除后无法在 SocketSweep 里恢复。请核对下面的完整路径,确认没有选错。
+              {t("confirm.note")}
             </p>
             <div className="rounded-lg border border-zinc-800 bg-zinc-950 divide-y divide-zinc-800/70 mb-5 max-h-64 overflow-y-auto">
               {[...selected.values()].slice(0, 20).map((n) => {
@@ -970,22 +970,23 @@ export function ResultView({
                     <span className="flex-1 min-w-0">
                       <span className="block text-xs font-mono text-zinc-300 break-all">{n.path}</span>
                       <span className="block text-[11px] text-zinc-600 mt-0.5">
-                        {formatBytes(n.size)} · {formatNumber(s.files)} 个文件{ n.type === "directory" ? ` · ${formatNumber(s.dirs)} 个文件夹` : ""}
+                        {formatBytes(n.size)} · {t("confirm.filesN", { count: formatNumber(s.files) })}
+                        {n.type === "directory" ? ` · ${t("confirm.dirsN", { count: formatNumber(s.dirs) })}` : ""}
                       </span>
                     </span>
                   </div>
                 );
               })}
               {selected.size > 20 && (
-                <div className="px-3 py-2 text-xs text-zinc-600">…还有 {selected.size - 20} 项</div>
+                <div className="px-3 py-2 text-xs text-zinc-600">{t("confirm.more", { count: selected.size - 20 })}</div>
               )}
             </div>
             <div className="flex items-center gap-3 justify-end">
               <button onClick={() => setConfirming(false)} className="px-4 py-2 rounded-lg text-sm font-medium text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 cursor-pointer">
-                取消 (Esc)
+                {t("common.cancelEsc")}
               </button>
               <button onClick={runDelete} className="px-4 py-2 rounded-lg text-sm font-bold bg-red-600 hover:bg-red-500 text-white cursor-pointer">
-                确认删除 · 释放 {formatBytes(selectedSize)}
+                {t("confirm.go", { size: formatBytes(selectedSize) })}
               </button>
             </div>
           </div>

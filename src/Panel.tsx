@@ -1,4 +1,5 @@
 import { useEffect, type ReactNode } from "react";
+import { useT } from "./i18n";
 
 export function IconClose() {
   return (
@@ -28,6 +29,7 @@ export function Panel({
   onClose: () => void;
   children: ReactNode;
 }) {
+  const t = useT();
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -48,8 +50,8 @@ export function Panel({
           {actions}
           <button
             onClick={onClose}
-            title="关闭 (Esc)"
-            aria-label="关闭"
+            title={t("common.closeEsc")}
+            aria-label={t("common.close")}
             className="w-8 h-8 rounded-lg flex items-center justify-center text-zinc-500 hover:text-zinc-100 hover:bg-zinc-800 transition-colors cursor-pointer shrink-0"
           >
             <IconClose />

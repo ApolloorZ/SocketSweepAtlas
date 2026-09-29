@@ -6,57 +6,46 @@ import { SettingsPanel } from "./SettingsPanel";
 import { useSettings } from "./settings";
 import { addNode, findNode, removeNode } from "./tree";
 import { formatBytes, formatNumber } from "./format";
-import type { AppPhase, Capacity, ScanResponse, Toast } from "./types";
+import { I18nContext, say, useI18n, useI18nValue, type Params } from "./i18n";
+import type { AppPhase, Capacity, FlowError, ScanResponse, Toast } from "./types";
 import "./App.css";
 
-// ── 后端错误中文化与排障建议 ────────────────────────────────────────────────
-// Rust 层返回的是固定几条英文错误,这里映射成中文并附上可操作的提示。
+// ── 排障建议 / troubleshooting ──────────────────────────────────────────────
+// adb and the Rust layer speak English (or return `E#codes`), so the recognition
+// below is language-neutral: it only ever picks which wording to show.
 
-const ERROR_TRANSLATIONS: { match: string; zh: string }[] = [
-  { match: "no android device detected", zh: "没有检测到手机。请用数据线连接,并在手机上允许 USB 调试。" },
-  { match: "usb debugging not authorised", zh: "手机上还没有点“允许 USB 调试”。请看手机屏幕上的弹窗并选择允许。" },
-  { match: "timed out", zh: "手机长时间没有响应,已超时。请重新插拔数据线后再试。" },
-  { match: "cannot connect to daemon", zh: "扫描程序没能启动。断开后重新连接一次通常即可恢复。" },
-  { match: "failed to read device storage capacity", zh: "读不到手机容量信息,占比会按已扫描总量估算。" },
-  { match: "unable to start pairing client", zh: "配不上:请填手机「使用配对码配对设备」界面上显示的那个 IP:端口,并确认 6 位码还没过期。" },
-  { match: "pairing failed", zh: "配对失败:配对码可能已过期。在手机上重新点一次「使用配对码配对设备」,再填新的码。" },
-  { match: "failed to connect to", zh: "连不上:确认手机和电脑连着同一个 Wi-Fi,并且手机上的「无线调试」开关还开着。" },
-  { match: "failed to execute adb", zh: "电脑端的 adb 无法运行,可能是安装不完整。" },
-  { match: "not found at", zh: "程序自带的文件缺失,需要重新安装。" },
-  { match: "permission denied", zh: "手机拒绝了这个操作,请检查开发者选项里的 USB 调试开关。" },
+interface Trouble {
+  match: RegExp;
+  /** Keys into the hint section; each is translated where it is drawn. */
+  hints: string[];
+}
+
+const TROUBLE: Trouble[] = [
+  {
+    match: /unauthoris|unauthoriz|E#unauthorized/i,
+    hints: ["hint.allowUsb"],
+  },
+  {
+    match: /no android device|no devices|E#no_usb_device|E#no_device/i,
+    hints: ["hint.pickDevice", "hint.cable", "hint.devOptionsUnlock", "hint.usbDebugOn"],
+  },
+  {
+    match: /局域网|无线调试|pairing|mdns|E#pair|E#connect/i,
+    hints: ["hint.wirelessDebugPage", "hint.sameWifi", "hint.useCable"],
+  },
+  {
+    match: /timed out|cannot connect to daemon|permission denied|E#timeout|E#daemon/i,
+    hints: ["hint.miuiSecure", "hint.samsungBlock", "hint.usbModeFiles"],
+  },
 ];
 
-function translateError(message: string): string {
-  const lower = message.toLowerCase();
-  return ERROR_TRANSLATIONS.find((e) => lower.includes(e.match))?.zh ?? message;
+function hintsFor(message: string): string[] {
+  return TROUBLE.find((entry) => entry.match.test(message))?.hints ?? [];
 }
 
-function hintsFor(message: string): string[] {
-  const lower = message.toLowerCase();
-  const hints: string[] = [];
-  if (lower.includes("unauthoris") || lower.includes("unauthoriz")) {
-    hints.push("在手机弹窗上点“允许 USB 调试”,可以勾选“一律允许”。");
-  }
-  if (lower.includes("没有找到设备") || lower.includes("no android device") || lower.includes("no devices")) {
-    if (lower.includes("没有找到设备")) {
-      hints.push("点下方「管理设备与配对」重新选一台,或者改点「无线连接」。");
-    }
-    hints.push("换一根数据线 —— 有些线只能充电,不能传数据。");
-    hints.push("手机:设置 → 关于手机 → 连续点“版本号”7 次,解锁开发者选项。");
-    hints.push("手机:设置 → 开发者选项 → 打开“USB 调试”。");
-  }
-  if (lower.includes("局域网") || lower.includes("无线调试") || lower.includes("pairing") || lower.includes("mdns")) {
-    hints.push("手机:开发者选项 → 无线调试 打开,并且停在这个页面别退出 —— 不少系统只在这个页面开着时才对外广播。");
-    hints.push("确认手机和电脑连的是同一个 Wi-Fi,而且路由器没开「AP 隔离 / 客户端隔离」。");
-    hints.push("实在找不到就改用有线连接,一根数据线就够,不受网络影响。");
-  }
-  if (lower.includes("timed out") || lower.includes("cannot connect to daemon") || lower.includes("permission denied")) {
-    hints.push("小米 / 红米:还要打开“USB 调试(安全设置)”。");
-    hints.push("三星:若 USB 调试变灰,请关闭“自动阻止”(设置 → 安全)。");
-    hints.push("手机下拉通知栏,把 USB 用途从“仅充电”改成“传输文件”。");
-  }
-  return hints;
-}
+/** The folder the phone-side scanner walks. One place to change when the scan
+ *  root becomes configurable. */
+const SCAN_ROOT = "/sdcard";
 
 // ── Icons ───────────────────────────────────────────────────────────────────
 
@@ -113,25 +102,26 @@ function Spinner({ size = 20, className = "" }: { size?: number; className?: str
 let toastId = 0;
 
 function ToastContainer({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: number) => void }) {
+  const { t } = useI18n();
   return (
     <div className="fixed top-4 right-4 z-50 flex flex-col gap-2 max-w-sm" id="toast-container">
-      {toasts.map((t) => (
+      {toasts.map((toast) => (
         <div
-          key={t.id}
+          key={toast.id}
           className={`
-            ${t.exiting ? "animate-toast-out" : "animate-toast-in"}
+            ${toast.exiting ? "animate-toast-out" : "animate-toast-in"}
             flex items-start gap-3 px-4 py-3 rounded-lg border shadow-xl cursor-pointer backdrop-blur-md
-            ${t.type === "error"
+            ${toast.type === "error"
               ? "bg-red-950/80 border-red-800/50 text-red-200"
-              : t.type === "success"
+              : toast.type === "success"
               ? "bg-emerald-950/80 border-emerald-800/50 text-emerald-200"
               : "bg-zinc-800/80 border-zinc-700/50 text-zinc-200"
             }
           `}
-          onClick={() => onDismiss(t.id)}
+          onClick={() => onDismiss(toast.id)}
         >
-          <span className="mt-0.5 text-base">{t.type === "error" ? "✕" : t.type === "success" ? "✓" : "ℹ"}</span>
-          <p className="text-sm leading-relaxed flex-1">{t.message}</p>
+          <span className="mt-0.5 text-base">{toast.type === "error" ? "✕" : toast.type === "success" ? "✓" : "ℹ"}</span>
+          <p className="text-sm leading-relaxed flex-1">{say(t, toast.message, toast.params)}</p>
         </div>
       ))}
     </div>
@@ -140,7 +130,16 @@ function ToastContainer({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id
 
 // ── Terminal log (developer detail, collapsed by default) ───────────────────
 
-function TerminalLog({ logs }: { logs: string[] }) {
+/** Kept as written so a line already on screen can be re-worded when the
+ *  language changes, instead of being frozen in whichever one typed it. */
+interface LogEntry {
+  at: string;
+  text: string;
+  params?: Params;
+}
+
+function TerminalLog({ logs }: { logs: LogEntry[] }) {
+  const { t } = useI18n();
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -152,7 +151,8 @@ function TerminalLog({ logs }: { logs: string[] }) {
       {logs.map((log, i) => (
         <div key={i} className="mb-0.5 break-all">
           <span className="text-accent-500 mr-2">❯</span>
-          {log}
+          <span className="text-zinc-600 mr-2">{log.at}</span>
+          {say(t, log.text, log.params)}
         </div>
       ))}
       <div ref={endRef} />
@@ -165,31 +165,32 @@ function TerminalLog({ logs }: { logs: string[] }) {
 type StepState = "pending" | "active" | "done" | "error";
 
 interface Step {
-  label: string;
+  key: string;
   state: StepState;
 }
 
 type ConnectMode = "usb" | "wireless";
 
 const USB_STEPS: Step[] = [
-  { label: "检查电脑端组件", state: "pending" },
-  { label: "连接手机并启动扫描程序", state: "pending" },
-  { label: "扫描手机存储", state: "pending" },
-  { label: "整理结果", state: "pending" },
+  { key: "step.checkTools", state: "pending" },
+  { key: "step.startDaemonUsb", state: "pending" },
+  { key: "step.scan", state: "pending" },
+  { key: "step.organise", state: "pending" },
 ];
 
 const WIRELESS_STEPS: Step[] = [
-  { label: "检查电脑端组件", state: "pending" },
-  { label: "在局域网里找到手机", state: "pending" },
-  { label: "启动手机上的扫描程序", state: "pending" },
-  { label: "扫描手机存储", state: "pending" },
-  { label: "整理结果", state: "pending" },
+  { key: "step.checkTools", state: "pending" },
+  { key: "step.findPhone", state: "pending" },
+  { key: "step.startDaemonWireless", state: "pending" },
+  { key: "step.scan", state: "pending" },
+  { key: "step.organise", state: "pending" },
 ];
 
 const stepsFor = (mode: ConnectMode): Step[] =>
   (mode === "usb" ? USB_STEPS : WIRELESS_STEPS).map((s) => ({ ...s }));
 
 function StepList({ steps }: { steps: Step[] }) {
+  const { t } = useI18n();
   const marks: Record<StepState, string> = { pending: "○", active: "◐", done: "●", error: "✕" };
   const colors: Record<StepState, string> = {
     pending: "text-zinc-600",
@@ -202,29 +203,37 @@ function StepList({ steps }: { steps: Step[] }) {
       {steps.map((s, i) => (
         <li key={i} className="flex items-center gap-2.5 text-sm">
           <span className={`w-4 text-center ${colors[s.state]} ${s.state === "active" ? "animate-pulse" : ""}`}>{marks[s.state]}</span>
-          <span className={s.state === "pending" ? "text-zinc-600" : "text-zinc-300"}>{s.label}</span>
+          <span className={s.state === "pending" ? "text-zinc-600" : "text-zinc-300"}>{t(s.key)}</span>
         </li>
       ))}
     </ul>
   );
 }
 
-function formatElapsed(ms: number): string {
+/** Wall-clock since the flow started, worded for the language in use. */
+function Elapsed({ ms }: { ms: number }) {
+  const { t } = useI18n();
   const total = ms / 1000;
-  if (total < 60) return `${total.toFixed(1)} 秒`;
-  return `${Math.floor(total / 60)} 分 ${Math.round(total % 60)} 秒`;
+  return (
+    <>
+      {total < 60
+        ? t("time.seconds", { n: total.toFixed(1) })
+        : t("time.minSec", { m: Math.floor(total / 60), s: Math.round(total % 60) })}
+    </>
+  );
 }
 
 function CancelButton({ onCancel }: { onCancel: () => void }) {
+  const { t } = useI18n();
   return (
     <div className="flex flex-col items-center gap-1">
       <button
         onClick={onCancel}
         className="px-4 py-1.5 rounded-lg text-xs font-medium text-zinc-400 border border-zinc-700/60 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer"
       >
-        取消等待
+        {t("connect.cancelWait")}
       </button>
-      <span className="text-[11px] text-zinc-600">取消后手机上的扫描仍会继续,稍后重连即可</span>
+      <span className="text-[11px] text-zinc-600">{t("connect.cancelWaitNote")}</span>
     </div>
   );
 }
@@ -232,29 +241,35 @@ function CancelButton({ onCancel }: { onCancel: () => void }) {
 // ── Persistent error card ───────────────────────────────────────────────────
 
 function ErrorCard({
-  title,
+  titleKey,
   message,
+  params,
   hints,
   onRetry,
-  retryLabel = "重试",
+  retryKey = "common.retry",
   onDismiss,
-  secondary,
+  secondaryKey,
+  onSecondary,
 }: {
-  title: string;
+  titleKey: string;
+  /** Whatever came back — a dictionary key, an `E#code`, or raw adb text. */
   message: string;
+  params?: Params;
   hints: string[];
   onRetry: () => void;
-  retryLabel?: string;
+  retryKey?: string;
   onDismiss?: () => void;
-  secondary?: { label: string; onClick: () => void };
+  secondaryKey?: string;
+  onSecondary?: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <div className="w-full max-w-md rounded-xl border border-danger-500/40 bg-danger-500/5 p-4 animate-fade-in-up">
       <div className="flex items-start gap-2.5">
         {onDismiss ? (
           <button
             onClick={onDismiss}
-            aria-label="关闭这条提示"
+            aria-label={t("common.close")}
             className="mt-0.5 w-5 h-5 -ml-1 flex items-center justify-center rounded text-danger-400 hover:bg-danger-500/15 cursor-pointer text-sm"
           >
             ✕
@@ -263,14 +278,14 @@ function ErrorCard({
           <span className="mt-0.5 text-danger-400 text-sm">✕</span>
         )}
         <div className="flex-1 min-w-0">
-          <h3 className="text-sm font-semibold text-danger-400">{title}</h3>
-          <p className="mt-1 text-sm text-zinc-300 leading-relaxed break-words">{message}</p>
+          <h3 className="text-sm font-semibold text-danger-400">{t(titleKey)}</h3>
+          <p className="mt-1 text-sm text-zinc-300 leading-relaxed break-words">{say(t, message, params)}</p>
           {hints.length > 0 && (
             <ul className="mt-3 flex flex-col gap-1.5">
               {hints.map((h, i) => (
                 <li key={i} className="text-xs text-zinc-500 leading-relaxed flex gap-2">
                   <span className="text-zinc-700">·</span>
-                  <span>{h}</span>
+                  <span>{say(t, h)}</span>
                 </li>
               ))}
             </ul>
@@ -280,14 +295,14 @@ function ErrorCard({
               onClick={onRetry}
               className="px-4 py-2 rounded-lg text-xs font-semibold bg-gradient-to-r from-accent-600 to-accent-500 text-white hover:from-accent-500 hover:to-accent-400 transition-colors cursor-pointer"
             >
-              {retryLabel}
+              {t(retryKey)}
             </button>
-            {secondary && (
+            {secondaryKey && onSecondary && (
               <button
-                onClick={secondary.onClick}
+                onClick={onSecondary}
                 className="px-4 py-2 rounded-lg text-xs font-medium text-zinc-300 border border-zinc-700 hover:bg-zinc-800 transition-colors cursor-pointer"
               >
-                {secondary.label}
+                {t(secondaryKey)}
               </button>
             )}
             {onDismiss && (
@@ -295,7 +310,7 @@ function ErrorCard({
                 onClick={onDismiss}
                 className="px-3 py-2 rounded-lg text-xs text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer"
               >
-                知道了
+                {t("common.known")}
               </button>
             )}
           </div>
@@ -316,7 +331,7 @@ function SetupScreen({
   flowError,
   onCancel,
   onDismissError,
-  targetLabel,
+  target,
   onOpenDevices,
 }: {
   mode: ConnectMode;
@@ -324,12 +339,19 @@ function SetupScreen({
   loading: boolean;
   steps: Step[];
   elapsedMs: number;
-  flowError: { message: string; hints: string[] } | null;
+  flowError: FlowError | null;
   onCancel: () => void;
   onDismissError: () => void;
-  targetLabel: string;
+  target: string | null;
   onOpenDevices: () => void;
 }) {
+  const { t } = useI18n();
+  const targetLabel = !target
+    ? t("connect.targetAuto")
+    : target.includes("_adb-tls-connect")
+      ? t("connect.targetWireless", { host: target.replace(/^adb-/, "").split(".")[0] })
+      : target;
+
   return (
     <div className="flex flex-col items-center justify-center flex-1 gap-7 px-6 animate-fade-in-up overflow-y-auto">
       <div className="flex flex-col items-center gap-5">
@@ -346,9 +368,9 @@ function SetupScreen({
             SocketSweep
           </h1>
           <p className="mt-1.5 text-sm text-zinc-500 leading-relaxed">
-            看清手机存储里到底装了什么
+            {t("connect.tagline")}
             <br />
-            <span className="text-zinc-600">绕开 MTP,直接读取文件系统</span>
+            <span className="text-zinc-600">{t("connect.tagline2")}</span>
           </p>
         </div>
       </div>
@@ -358,7 +380,7 @@ function SetupScreen({
           <StepList steps={steps} />
           <div className="flex items-center gap-2 text-xs font-mono text-zinc-500">
             <Spinner size={14} className="text-accent-400" />
-            已用 {formatElapsed(elapsedMs)}
+            {t("connect.elapsedPrefix")} <Elapsed ms={elapsedMs} />
           </div>
           <CancelButton onCancel={onCancel} />
         </>
@@ -366,13 +388,15 @@ function SetupScreen({
         <>
           {flowError && (
             <ErrorCard
-              title="连接失败"
+              titleKey="connect.failed"
               message={flowError.message}
+              params={flowError.params}
               hints={flowError.hints}
               onRetry={() => onConnect(mode)}
-              retryLabel="重新连接"
+              retryKey="connect.retry"
               onDismiss={onDismissError}
-              secondary={{ label: "选择其他设备", onClick: onOpenDevices }}
+              secondaryKey="connect.otherDevice"
+              onSecondary={onOpenDevices}
             />
           )}
 
@@ -380,8 +404,8 @@ function SetupScreen({
           <div className="grid grid-cols-2 gap-3 w-full max-w-md">
             {(
               [
-                { key: "usb" as const, icon: <IconUsb />, title: "有线连接", note: "插好数据线,开了 USB 调试就行" },
-                { key: "wireless" as const, icon: <IconWifi />, title: "无线连接", note: "和电脑连同一个 Wi-Fi,不用线" },
+                { key: "usb" as const, icon: <IconUsb />, titleKey: "connect.usb", noteKey: "connect.usbNote" },
+                { key: "wireless" as const, icon: <IconWifi />, titleKey: "connect.wireless", noteKey: "connect.wirelessNote" },
               ]
             ).map((entry) => (
               <button
@@ -395,15 +419,15 @@ function SetupScreen({
                 }`}
               >
                 <span className="text-accent-400">{entry.icon}</span>
-                <span className="text-sm font-semibold text-zinc-100">{entry.title}</span>
-                <span className="text-[11px] text-zinc-500 leading-snug">{entry.note}</span>
+                <span className="text-sm font-semibold text-zinc-100">{t(entry.titleKey)}</span>
+                <span className="text-[11px] text-zinc-500 leading-snug">{t(entry.noteKey)}</span>
               </button>
             ))}
           </div>
 
           <div className="flex flex-col items-center gap-1.5 text-xs text-zinc-600">
-            <p>· 手机不用装 App,也不需要 root</p>
-            <p>· 无线第一次要配对一次,以后点一下就自动连上并开始扫描</p>
+            <p>· {t("connect.noteNoApp")}</p>
+            <p>· {t("connect.notePairOnce")}</p>
           </div>
 
           <button
@@ -411,7 +435,7 @@ function SetupScreen({
             onClick={onOpenDevices}
             className="text-xs text-zinc-500 hover:text-accent-400 transition-colors cursor-pointer underline underline-offset-2 decoration-zinc-700 hover:decoration-accent-500"
           >
-            目标设备:{targetLabel} · 管理设备与配对
+            {t("connect.manageDevices", { target: targetLabel })}
           </button>
         </>
       )}
@@ -420,6 +444,7 @@ function SetupScreen({
 }
 
 function ScanningScreen({ steps, elapsedMs, onCancel }: { steps: Step[]; elapsedMs: number; onCancel: () => void }) {
+  const { t } = useI18n();
   return (
     <div className="flex flex-col items-center justify-center flex-1 gap-6 px-6 animate-fade-in-up">
       <div className="relative w-28 h-28">
@@ -441,12 +466,12 @@ function ScanningScreen({ steps, elapsedMs, onCancel }: { steps: Step[]; elapsed
       </div>
 
       <div className="text-center">
-        <h2 className="text-lg font-semibold text-zinc-200">正在扫描手机存储</h2>
-        <p className="mt-1 text-xs text-zinc-600">一般 10–60 秒,期间不要拔线</p>
+        <h2 className="text-lg font-semibold text-zinc-200">{t("scanning.title")}</h2>
+        <p className="mt-1 text-xs text-zinc-600">{t("scanning.note")}</p>
       </div>
 
       <StepList steps={steps} />
-      <div className="text-sm font-mono text-accent-400">已用 {formatElapsed(elapsedMs)}</div>
+      <div className="text-sm font-mono text-accent-400">{t("connect.elapsedPrefix")} <Elapsed ms={elapsedMs} /></div>
       <CancelButton onCancel={onCancel} />
     </div>
   );
@@ -459,12 +484,13 @@ function App() {
   const [scanData, setScanData] = useState<ScanResponse | null>(null);
   const [capacity, setCapacity] = useState<Capacity | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
-  const [logs, setLogs] = useState<string[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
   const { settings, patch: patchSettings } = useSettings();
+  const i18n = useI18nValue(settings.lang);
   const [logsOpen, setLogsOpen] = useState(settings.logsOpen);
   const [steps, setSteps] = useState<Step[]>(() => stepsFor("usb"));
   const [elapsedMs, setElapsedMs] = useState(0);
-  const [flowError, setFlowError] = useState<{ message: string; hints: string[] } | null>(null);
+  const [flowError, setFlowError] = useState<FlowError | null>(null);
   const [target, setTarget] = useState<string | null>(() => localStorage.getItem("ss-target"));
   const [mode, setMode] = useState<ConnectMode>("usb");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -480,6 +506,11 @@ function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = settings.theme;
   }, [settings.theme]);
+
+  // Screen readers and `Intl` both read this, so it has to follow the choice.
+  useEffect(() => {
+    document.documentElement.lang = settings.lang === "zh" ? "zh-CN" : "en";
+  }, [settings.lang]);
 
   // The two folders live in Rust, which is where every file operation happens.
   // The settings page reports failures itself; this only keeps both in step.
@@ -499,8 +530,8 @@ function App() {
 
   useEffect(() => { scanDataRef.current = scanData; }, [scanData]);
 
-  const addLog = useCallback((msg: string) => {
-    setLogs((prev) => [...prev.slice(-199), `[${new Date().toLocaleTimeString()}] ${msg}`]);
+  const addLog = useCallback((text: string, params?: Params) => {
+    setLogs((prev) => [...prev.slice(-199), { at: new Date().toLocaleTimeString(), text, params }]);
   }, []);
 
   useEffect(() => {
@@ -511,9 +542,9 @@ function App() {
     return () => clearInterval(id);
   }, [phase]);
 
-  const pushToast = useCallback((message: string, type: Toast["type"] = "error") => {
+  const pushToast = useCallback((message: string, type: Toast["type"] = "error", params?: Params) => {
     const id = ++toastId;
-    setToasts((prev) => [...prev, { id, message, type }]);
+    setToasts((prev) => [...prev, { id, message, type, params }]);
     const timer = setTimeout(() => {
       setToasts((prev) => prev.map((t) => (t.id === id ? { ...t, exiting: true } : t)));
       setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 300);
@@ -531,15 +562,16 @@ function App() {
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 300);
   }, []);
 
-  const markStep = useCallback((label: string, state: StepState) => {
-    activeStepRef.current = label;
-    setSteps((prev) => prev.map((s) => (s.label === label ? { ...s, state } : s)));
+  const markStep = useCallback((key: string, state: StepState) => {
+    activeStepRef.current = key;
+    setSteps((prev) => prev.map((s) => (s.key === key ? { ...s, state } : s)));
   }, []);
 
+  /** The raw text is kept so the card can be re-worded after a language change. */
   const failFlow = useCallback((message: string) => {
     if (activeStepRef.current) markStep(activeStepRef.current, "error");
-    setFlowError({ message: translateError(message), hints: hintsFor(message) });
-    addLog(`[ERROR] ${message}`);
+    setFlowError({ message, hints: hintsFor(message) });
+    addLog("log.error", { detail: message });
   }, [markStep, addLog]);
 
   /// One press runs everything: find the phone, start the daemon, scan, render.
@@ -554,21 +586,21 @@ function App() {
     setSteps(stepsFor(connectMode));
     setPhase("connecting");
 
-    const daemonStep = connectMode === "usb" ? "连接手机并启动扫描程序" : "启动手机上的扫描程序";
+    const daemonStep = connectMode === "usb" ? "step.startDaemonUsb" : "step.startDaemonWireless";
 
     try {
-      markStep("检查电脑端组件", "active");
-      addLog("[ADB] 检查电脑端组件…");
+      markStep("step.checkTools", "active");
+      addLog("log.checkAdb");
       const adbVersion = await callBackend<string>("check_adb");
       if (stale()) return;
       addLog(`[ADB] ${adbVersion}`);
-      markStep("检查电脑端组件", "done");
+      markStep("step.checkTools", "done");
 
       let serial = target;
 
       if (connectMode === "wireless") {
-        markStep("在局域网里找到手机", "active");
-        addLog("[ADB] 在局域网里找已配对的手机…");
+        markStep("step.findPhone", "active");
+        addLog("log.findPhone");
         const found = JSON.parse(await callBackend<string>("wireless_auto_connect")) as {
           status: string;
           serial: string | null;
@@ -580,10 +612,10 @@ function App() {
           setPhase("setup");
           return;
         }
-        addLog(`[ADB] 已经连上 ${found.serial}。`);
+        addLog("log.connectedTo", { serial: found.serial });
         serial = found.serial;
         setTarget(found.serial);
-        markStep("在局域网里找到手机", "done");
+        markStep("step.findPhone", "done");
       } else {
         // Prefer the wired transport so an old wireless one cannot hijack the scan.
         const devices = JSON.parse(await callBackend<string>("list_devices")) as {
@@ -593,20 +625,20 @@ function App() {
         }[];
         if (stale()) return;
         const usb = devices.find((d) => d.kind === "usb" && d.status === "device");
-        if (!usb) throw new Error("没有找到设备:这台电脑上没有处于 USB 调试状态的手机。");
+        if (!usb) throw new Error("E#no_usb_device");
         serial = usb.serial;
         setTarget(usb.serial);
       }
 
       markStep(daemonStep, "active");
-      addLog("[ADB] 推送并启动扫描程序…");
+      addLog("log.pushDaemon");
       const started = await callBackend<string>("init_daemon", serial ? { serial } : undefined);
       if (stale()) return;
       // A wireless phone re-registers under a new name whenever its IP or debug
       // port moves, so pin whichever serial the backend really drove.
       const usedSerial = (JSON.parse(started) as { serial?: string }).serial;
       if (usedSerial && usedSerial !== target) setTarget(usedSerial);
-      addLog("[SOCKET] 扫描程序已经响应。");
+      addLog("log.daemonAlive");
       markStep(daemonStep, "done");
 
       // Capacity is advisory: a failure here must not block the scan.
@@ -618,21 +650,21 @@ function App() {
       }
 
       setPhase("scanning");
-      markStep("扫描手机存储", "active");
-      addLog("[SCAN] 请求扫描 /sdcard …");
-      const raw = await callBackend<string>("run_scan", { path: "/sdcard" });
+      markStep("step.scan", "active");
+      addLog("log.scanRequest", { root: SCAN_ROOT });
+      const raw = await callBackend<string>("run_scan", { path: SCAN_ROOT });
       if (stale()) return;
-      markStep("扫描手机存储", "done");
+      markStep("step.scan", "done");
 
-      markStep("整理结果", "active");
+      markStep("step.organise", "active");
       const parsed: ScanResponse = JSON.parse(raw);
-      if (parsed.status !== "ok") throw new Error(parsed.status || "扫描返回了异常状态");
+      if (parsed.status !== "ok") throw new Error(`E#scan_status#${parsed.status || "?"}`);
       if (stale()) return;
-      markStep("整理结果", "done");
+      markStep("step.organise", "done");
 
       setScanData(parsed);
       setPhase("result");
-      addLog(`[SCAN] 完成:${formatNumber(parsed.total_files)} 个文件,${parsed.scan_time_ms}ms。`);
+      addLog("log.scanDone", { files: formatNumber(parsed.total_files), ms: parsed.scan_time_ms });
     } catch (err: unknown) {
       if (stale()) return;
       failFlow(err instanceof Error ? err.message : String(err));
@@ -644,37 +676,37 @@ function App() {
     const runId = ++runIdRef.current;
     const stale = () => runIdRef.current !== runId;
     const rescanSteps: Step[] = [
-      { label: "扫描手机存储", state: "active" },
-      { label: "整理结果", state: "pending" },
+      { key: "step.scan", state: "active" },
+      { key: "step.organise", state: "pending" },
     ];
 
     setFlowError(null);
     setSteps(rescanSteps);
     setPhase("scanning");
-    addLog("[SCAN] 重新扫描 /sdcard …");
+    addLog("log.rescan", { root: SCAN_ROOT });
     try {
-      const raw = await callBackend<string>("run_scan", { path: "/sdcard" });
+      const raw = await callBackend<string>("run_scan", { path: SCAN_ROOT });
       if (stale()) return;
       setSteps(rescanSteps.map((s, i) => ({ ...s, state: (i === 0 ? "done" : "active") as StepState })));
       const parsed: ScanResponse = JSON.parse(raw);
       if (stale()) return;
       setScanData(parsed);
       setPhase("result");
-      addLog(`[SCAN] 完成:${parsed.scan_time_ms}ms。`);
+      addLog("log.scanDone", { files: formatNumber(parsed.total_files), ms: parsed.scan_time_ms });
     } catch (err: unknown) {
       if (stale()) return;
       const message = err instanceof Error ? err.message : String(err);
       setSteps(rescanSteps.map((s, i) => ({ ...s, state: (i === 0 ? "error" : s.state) as StepState })));
-      setFlowError({ message: translateError(message), hints: hintsFor(message) });
-      addLog(`[ERROR] ${message}`);
+      setFlowError({ message, hints: hintsFor(message) });
+      addLog("log.error", { detail: message });
       setPhase("result");
     }
   }, [addLog]);
 
   const handleCancelWait = useCallback(() => {
     runIdRef.current++;
-    addLog("[UI] 用户取消了等待。");
-    pushToast("已取消等待", "info");
+    addLog("log.cancelWait");
+    pushToast("toast.waitCancelled", "info");
     setSteps(stepsFor(mode));
     setPhase(scanData ? "result" : "setup");
   }, [addLog, pushToast, scanData, mode]);
@@ -711,7 +743,7 @@ function App() {
       total_files: base.total_files + added,
       total_size: base.total_size + bytes,
     });
-    pushToast(`已上传 ${added} 个文件,共 ${formatBytes(bytes)}`, "success");
+    pushToast("toast.uploaded", "success", { count: added, size: formatBytes(bytes) });
   }, [pushToast]);
 
   // A move keeps the same bytes, so the totals do not change — but the source
@@ -719,7 +751,7 @@ function App() {
   const handleMovePaths = useCallback(async (paths: string[], dest: string) => {
     const base = scanDataRef.current;
     if (!base || paths.length === 0) return;
-    addLog(`[MOVE] 正在移动 ${paths.length} 项到 ${dest}…`);
+    addLog("log.moveStart", { count: paths.length, dest });
     try {
       const raw = await callBackend<string>("move_items", { paths, dest });
       const result = JSON.parse(raw) as {
@@ -736,30 +768,31 @@ function App() {
         if (added.added) tree = added.root;
       }
       if (result.moved.length > 0) setScanData({ ...base, tree });
-      if (result.moved.length > 0) pushToast(`已移动 ${result.moved.length} 项`, "success");
+      if (result.moved.length > 0) pushToast("toast.moved", "success", { count: result.moved.length });
       if (result.failed.length > 0) {
         setFlowError({
-          message: `${result.failed.length} 项没能移动`,
-          hints: result.failed.slice(0, 6).map((f) => `· ${f}`),
+          message: "err.moveFailed",
+          params: { count: result.failed.length },
+          hints: result.failed.slice(0, 6),
         });
       }
-      addLog(`[MOVE] 完成:成功 ${result.moved.length} 项,失败 ${result.failed.length} 项。`);
+      addLog("log.moveDone", { ok: result.moved.length, failed: result.failed.length });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      setFlowError({ message: translateError(message), hints: hintsFor(message) });
-      addLog(`[ERROR] ${message}`);
+      setFlowError({ message, hints: hintsFor(message) });
+      addLog("log.error", { detail: message });
     }
   }, [addLog, pushToast]);
 
   const handleDisconnect = useCallback(async () => {
     runIdRef.current++;
-    addLog("[SOCKET] 断开扫描程序…");
+    addLog("log.stopDaemon");
     try {
       await callBackend<string>("stop_daemon");
-      pushToast("已断开手机", "info");
-      addLog("[SOCKET] 扫描程序已退出。");
+      pushToast("toast.disconnected", "info");
+      addLog("log.daemonStopped");
     } catch {
-      addLog("[SOCKET] 扫描程序本来就没在运行。");
+      addLog("log.daemonWasIdle");
     }
     setScanData(null);
     setCapacity(null);
@@ -770,7 +803,7 @@ function App() {
   const handleDeletePaths = useCallback(async (paths: string[]) => {
     if (paths.length === 0) return;
     const base = scanDataRef.current;
-    addLog(`[DELETE] 正在删除 ${paths.length} 项…`);
+    addLog("log.deleteStart", { count: paths.length });
 
     let tree = base?.tree ?? null;
     let freed = 0;
@@ -780,7 +813,7 @@ function App() {
 
     for (const path of paths) {
       if (base && path === base.tree.path) {
-        failed.push("扫描根目录");
+        failed.push("err.scanRoot");
         continue;
       }
       try {
@@ -800,7 +833,7 @@ function App() {
         }
       } catch (err: unknown) {
         failed.push(path);
-        addLog(`[ERROR] ${err instanceof Error ? err.message : String(err)}`);
+        addLog("log.error", { detail: err instanceof Error ? err.message : String(err) });
       }
     }
 
@@ -815,7 +848,7 @@ function App() {
     }
 
     const okCount = paths.length - failed.length;
-    if (okCount > 0) pushToast(`已删除 ${okCount} 项,释放 ${formatBytes(freed)}`, "success");
+    if (okCount > 0) pushToast("toast.deleted", "success", { count: okCount, size: formatBytes(freed) });
 
     // The capacity strip came from `df` at connect time; after freeing gigabytes
     // it has to be asked again or it keeps showing the old numbers.
@@ -828,11 +861,12 @@ function App() {
     }
     if (failed.length > 0) {
       setFlowError({
-        message: `${failed.length} 项删除失败:${failed.slice(0, 3).join("、")}${failed.length > 3 ? " …" : ""}`,
-        hints: ["手机上该文件可能正在被应用使用,或权限不足。"],
+        message: "err.deleteFailed",
+        params: { list: `${failed.slice(0, 3).join(", ")}${failed.length > 3 ? " …" : ""}` },
+        hints: ["hint.deleteInUse"],
       });
     }
-    addLog(`[DELETE] 完成:成功 ${okCount} 项,失败 ${failed.length} 项,释放 ${formatBytes(freed)}。`);
+    addLog("log.deleteDone", { ok: okCount, failed: failed.length, size: formatBytes(freed) });
   }, [addLog, pushToast]);
 
   useEffect(() => {
@@ -841,111 +875,107 @@ function App() {
   }, []);
 
   return (
-    <div className="h-screen flex flex-col bg-surface-0 overflow-hidden">
-      <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+    <I18nContext.Provider value={i18n}>
+      <div className="h-screen flex flex-col bg-surface-0 overflow-hidden">
+        <ToastContainer toasts={toasts} onDismiss={dismissToast} />
 
-      {isMockMode && (
-        <div className="shrink-0 bg-amber-500/15 border-b border-amber-500/30 text-amber-300 text-[11px] px-3 py-1 font-mono">
-          演示数据模式 · 当前在浏览器里运行,连接的是模拟数据,不会碰到手机
-        </div>
-      )}
-
-      <div className="flex-1 flex flex-col min-h-0">
-        {(phase === "setup" || phase === "connecting") && (
-          <SetupScreen
-            mode={mode}
-            onConnect={(next) => void runFlow(next)}
-            loading={phase === "connecting"}
-            steps={steps}
-            elapsedMs={elapsedMs}
-            flowError={flowError}
-            onCancel={handleCancelWait}
-            onDismissError={() => setFlowError(null)}
-            targetLabel={
-              !target
-                ? "自动找到的那一台"
-                : target.includes("_adb-tls-connect")
-                  ? `无线 · ${target.replace(/^adb-/, "").split(".")[0]}`
-                  : target
-            }
-            onOpenDevices={() => setPanel({ intent: "manage", endpoint: null })}
-          />
-        )}
-        {phase === "scanning" && <ScanningScreen steps={steps} elapsedMs={elapsedMs} onCancel={handleCancelWait} />}
-        {phase === "result" && scanData && scanData.total_files === 0 && (
-          <div className="flex flex-col flex-1 min-h-0">
-            <EmptyScanScreen onRescan={handleRescan} onDisconnect={handleDisconnect} />
+        {isMockMode && (
+          <div className="shrink-0 bg-amber-500/15 border-b border-amber-500/30 text-amber-300 text-[11px] px-3 py-1 font-mono">
+            {i18n.t("app.mockBanner")}
           </div>
         )}
-        {phase === "result" && scanData && scanData.total_files > 0 && (
-          <ResultView
-            data={scanData}
-            capacity={capacity}
-            onRescan={handleRescan}
-            onDisconnect={handleDisconnect}
-            onDeletePaths={handleDeletePaths}
-            onMovePaths={handleMovePaths}
-            notify={(message) => pushToast(message)}
-            onUploaded={handleUploaded}
-            flowError={flowError}
-            onDismissError={() => setFlowError(null)}
-          />
-        )}
-      </div>
 
-      <div className="shrink-0 border-t border-zinc-800/80 bg-zinc-950">
-        <div className="flex items-center gap-3 px-4 py-1.5">
-          <button
-            onClick={() => {
-              const next = !logsOpen;
-              setLogsOpen(next);
-              patchSettings({ logsOpen: next });
-            }}
-            className="flex items-center gap-2 text-[11px] text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer"
-          >
-            <IconChevron open={logsOpen} />
-            <span>详细日志</span>
-            {logs.length > 0 && <span className="text-zinc-700">({logs.length} 条)</span>}
-          </button>
-          <div className="ml-auto flex items-center gap-3">
-            {flowError && <span className="text-[11px] text-danger-400">最近一次操作有错误</span>}
+        <div className="flex-1 flex flex-col min-h-0">
+          {(phase === "setup" || phase === "connecting") && (
+            <SetupScreen
+              mode={mode}
+              onConnect={(next) => void runFlow(next)}
+              loading={phase === "connecting"}
+              steps={steps}
+              elapsedMs={elapsedMs}
+              flowError={flowError}
+              onCancel={handleCancelWait}
+              onDismissError={() => setFlowError(null)}
+              target={target}
+              onOpenDevices={() => setPanel({ intent: "manage", endpoint: null })}
+            />
+          )}
+          {phase === "scanning" && <ScanningScreen steps={steps} elapsedMs={elapsedMs} onCancel={handleCancelWait} />}
+          {phase === "result" && scanData && scanData.total_files === 0 && (
+            <div className="flex flex-col flex-1 min-h-0">
+              <EmptyScanScreen onRescan={handleRescan} onDisconnect={handleDisconnect} />
+            </div>
+          )}
+          {phase === "result" && scanData && scanData.total_files > 0 && (
+            <ResultView
+              data={scanData}
+              capacity={capacity}
+              onRescan={handleRescan}
+              onDisconnect={handleDisconnect}
+              onDeletePaths={handleDeletePaths}
+              onMovePaths={handleMovePaths}
+              notify={(message, params) => pushToast(message, "error", params)}
+              onUploaded={handleUploaded}
+              flowError={flowError}
+              onDismissError={() => setFlowError(null)}
+            />
+          )}
+        </div>
+
+        <div className="shrink-0 border-t border-zinc-800/80 bg-zinc-950">
+          <div className="flex items-center gap-3 px-4 py-1.5">
             <button
-              id="btn-settings"
-              onClick={() => setSettingsOpen(true)}
-              title="设置"
-              aria-label="打开设置"
-              className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer shrink-0"
+              onClick={() => {
+                const next = !logsOpen;
+                setLogsOpen(next);
+                patchSettings({ logsOpen: next });
+              }}
+              className="flex items-center gap-2 text-[11px] text-zinc-500 hover:text-zinc-300 transition-colors cursor-pointer"
             >
-              <IconGear />
-              设置
+              <IconChevron open={logsOpen} />
+              <span>{i18n.t("app.logToggle")}</span>
+              {logs.length > 0 && <span className="text-zinc-700">({i18n.t("app.logCount", { count: logs.length })})</span>}
             </button>
+            <div className="ml-auto flex items-center gap-3">
+              {flowError && <span className="text-[11px] text-danger-400">{i18n.t("app.lastError")}</span>}
+              <button
+                id="btn-settings"
+                onClick={() => setSettingsOpen(true)}
+                title={i18n.t("app.settings")}
+                aria-label={i18n.t("app.settings")}
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer shrink-0"
+              >
+                <IconGear />
+                {i18n.t("app.settings")}
+              </button>
+            </div>
           </div>
+          {logsOpen && <TerminalLog logs={logs} />}
         </div>
-        {logsOpen && <TerminalLog logs={logs} />}
+
+        {settingsOpen && (
+          <SettingsPanel
+            settings={settings}
+            onPatch={patchSettings}
+            target={target}
+            onResetTarget={() => setTarget(null)}
+            onOpenDevices={() => setPanel({ intent: "manage", endpoint: null })}
+            onClose={() => setSettingsOpen(false)}
+          />
+        )}
+
+        {panel && (
+          <DevicePanel
+            target={target}
+            intent={panel.intent}
+            pairingEndpoint={panel.endpoint}
+            onPickTarget={(serial) => { setTarget(serial); setFlowError(null); }}
+            onConnected={(serial) => { setPanel(null); setTarget(serial); void runFlow("wireless"); }}
+            onClose={() => setPanel(null)}
+          />
+        )}
       </div>
-
-      {settingsOpen && (
-        <SettingsPanel
-          settings={settings}
-          onPatch={patchSettings}
-          target={target}
-          onResetTarget={() => setTarget(null)}
-          onOpenDevices={() => setPanel({ intent: "manage", endpoint: null })}
-          onClose={() => setSettingsOpen(false)}
-        />
-      )}
-
-      {panel && (
-        <DevicePanel
-          target={target}
-          intent={panel.intent}
-          pairingEndpoint={panel.endpoint}
-          onPickTarget={(serial) => { setTarget(serial); setFlowError(null); }}
-          onConnected={(serial) => { setPanel(null); setTarget(serial); void runFlow("wireless"); }}
-          onClose={() => setPanel(null)}
-        />
-      )}
-    </div>
+    </I18nContext.Provider>
   );
 }
 
