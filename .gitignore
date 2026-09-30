@@ -32,6 +32,9 @@ src-tauri/bin/adb.exe
 src-tauri/bin/AdbWinApi.dll
 src-tauri/bin/AdbWinUsbApi.dll
 
+# The GNU toolchain links this dynamically, so a local build has to ship it
+src-tauri/webview2/WebView2Loader.dll
+
 # Exclude local JSON test dumps
 out*.json
 
