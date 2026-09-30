@@ -272,15 +272,16 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
       const dir = mockDirs[String(args?.kind ?? "cache")] ?? mockDirs.cache;
       return wait(200).then(() => JSON.stringify(dir));
     }
-    case "dir_list": {
-      const dir = mockDirs[String(args?.kind ?? "cache")] ?? mockDirs.cache;
-      return wait(250).then(() =>
+    // The downloads panel lists what this app pulled, not the folder.
+    case "stat_paths": {
+      const paths = (args?.paths ?? []) as string[];
+      return wait(200).then(() =>
         JSON.stringify(
-          Array.from({ length: dir.files }, (_, i) => ({
-            name: `mock-file-${i + 1}.bin`,
-            bytes: Math.round(dir.bytes / Math.max(1, dir.files)),
-            mtime: Math.floor(Date.now() / 1000) - i * 3600,
-            path: `${dir.path}\\mock-file-${i + 1}.bin`,
+          paths.map((path, i) => ({
+            name: path.slice(Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/")) + 1),
+            bytes: 1024 * 1024 * (i + 1),
+            mtime: Math.floor(Date.now() / 1000) - i * 60,
+            path,
           }))
         )
       );

@@ -45,19 +45,19 @@ export function Panel({
           wide ? "w-full max-w-2xl" : "w-full max-w-xl"
         }`}
       >
-        <div className="flex items-center gap-2 px-6 py-3.5 border-b border-zinc-800 sticky top-0 bg-zinc-900">
+        <div className="flex items-center gap-2 px-6 py-3.5 border-b border-zinc-800 sticky top-0 z-10 bg-zinc-900">
           <h3 className="text-base font-bold text-zinc-100 flex-1">{title}</h3>
           {actions}
           <button
             onClick={onClose}
             title={t("common.closeEsc")}
             aria-label={t("common.close")}
-            className="w-8 h-8 rounded-lg flex items-center justify-center text-zinc-500 hover:text-zinc-100 hover:bg-zinc-800 transition-colors cursor-pointer shrink-0"
+            className="relative z-10 w-8 h-8 rounded-lg flex items-center justify-center text-zinc-500 hover:text-zinc-100 hover:bg-zinc-800 transition-colors cursor-pointer shrink-0"
           >
             <IconClose />
           </button>
         </div>
-        <div className="px-6 py-4 flex flex-col gap-5">{children}</div>
+        <div className="px-6 py-4 flex flex-col gap-5 isolate">{children}</div>
       </div>
     </div>
   );

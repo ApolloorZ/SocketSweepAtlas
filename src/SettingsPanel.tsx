@@ -231,13 +231,6 @@ export function SettingsPanel({
             label={t("set.shareBar")}
           />
         </Row>
-        <Row title={t("set.thumbnails")} note={t("set.thumbnailsNote")}>
-          <Switch
-            on={settings.thumbnails}
-            onToggle={() => onPatch({ thumbnails: !settings.thumbnails })}
-            label={t("set.thumbnails")}
-          />
-        </Row>
         <Row title={t("set.shareColor")} note={t("set.shareColorNote")}>
           <label
             className={`flex items-center gap-2 shrink-0 ${settings.rowShareBar ? "cursor-pointer" : "opacity-40"}`}
@@ -255,6 +248,13 @@ export function SettingsPanel({
               />
             </span>
           </label>
+        </Row>
+        <Row title={t("set.thumbnails")} note={t("set.thumbnailsNote")}>
+          <Switch
+            on={settings.thumbnails}
+            onToggle={() => onPatch({ thumbnails: !settings.thumbnails })}
+            label={t("set.thumbnails")}
+          />
         </Row>
       </Group>
 

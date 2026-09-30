@@ -74,13 +74,24 @@ pub(crate) fn get_bundled_binary(app: &tauri::AppHandle, name: &str) -> Result<s
 
 // ── ADB helper ──────────────────────────────────────────────────────────────
 
+/// A GUI app has no console, so every child it spawns gets one of its own —
+/// which meant a black box flashing once per adb call.
+fn hide_console(mut cmd: Command) -> Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
 /// Run an ADB command and return its stdout. Maps any failure to a
 /// human-readable `Err(String)`.
 pub(crate) fn adb(adb_path: &std::path::Path, args: &[&str]) -> Result<String, String> {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
-    let mut child = Command::new(adb_path)
+    let mut child = hide_console(Command::new(adb_path))
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -530,7 +541,7 @@ fn peek_file(app: tauri::AppHandle, device_path: String, limit: u32) -> Result<S
     args.push("exec-out".into());
     args.push(command);
 
-    let output = Command::new(&adb_path)
+    let output = hide_console(Command::new(&adb_path))
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -554,6 +565,30 @@ fn local_file_sizes(paths: Vec<String>) -> Result<String, String> {
         })
         .collect();
     serde_json::to_string(&out).map_err(|e| format!("Failed to report file sizes: {e}"))
+}
+
+/// Stats the files this app pulled, newest first. The download folder is the
+/// user's own and holds whatever he put there, so the panel lists recorded
+/// paths rather than the folder — and a file he moved or deleted just drops off.
+#[tauri::command(async)]
+fn stat_paths(paths: Vec<String>) -> String {
+    let mut out: Vec<Listed> = paths
+        .iter()
+        .filter_map(|path| {
+            let meta = std::fs::metadata(path).ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            Some(Listed {
+                name: std::path::Path::new(path).file_name()?.to_str()?.to_string(),
+                bytes: meta.len(),
+                mtime: meta.modified().ok().map(epoch_secs).unwrap_or(0),
+                path: path.clone(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    serde_json::to_string(&out).unwrap_or_else(|_| "[]".into())
 }
 
 /// Copies a local file into a folder on the phone and reports progress.
@@ -588,7 +623,7 @@ fn push_file(app: tauri::AppHandle, local_path: String, device_dir: String) -> R
     args.push(remote.clone());
 
     CANCEL_TRANSFER.store(false, Ordering::Relaxed);
-    let mut child = Command::new(&adb_path)
+    let mut child = hide_console(Command::new(&adb_path))
         .args(&args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1042,25 +1077,6 @@ struct Listed {
     path: String,
 }
 
-/// The contents of the cache or download folder, newest first, for the downloads
-/// panel. Capped because the folder is the user's to keep filling.
-#[tauri::command(async)]
-fn dir_list(app: tauri::AppHandle, kind: String) -> Result<String, String> {
-    let entries: Vec<Listed> = dir_entries(&dir_for(&app, &kind)?)
-        .into_iter()
-        .filter_map(|(path, bytes, mtime)| {
-            Some(Listed {
-                name: path.file_name()?.to_str()?.to_string(),
-                bytes,
-                mtime,
-                path: path.to_string_lossy().into_owned(),
-            })
-        })
-        .take(200)
-        .collect();
-    serde_json::to_string(&entries).map_err(|e| e.to_string())
-}
-
 /// Deletes cached copies, oldest first, until the folder fits under
 /// `limit_bytes`; `all` empties it. Safe to sweep because a folder holding other
 /// files can never be chosen as the cache location.
@@ -1264,7 +1280,7 @@ fn pull_file(
         args.extend(["pull", device_path.as_str(), local_str.as_str()]);
 
         CANCEL_TRANSFER.store(false, Ordering::Relaxed);
-        let mut child = Command::new(&adb_path)
+        let mut child = hide_console(Command::new(&adb_path))
             .args(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -1361,6 +1377,7 @@ pub fn run() {
             move_items,
             push_file,
             local_file_sizes,
+            stat_paths,
             peek_file,
             list_devices,
             pair_device,
@@ -1371,7 +1388,6 @@ pub fn run() {
             wireless_auto_connect,
             set_paths,
             dir_stats,
-            dir_list,
             disk_free,
             cached_entries,
             trim_cache,

@@ -81,6 +81,35 @@ export const CANCELLED = "E#cancelled";
 /** Broadcast when the cache folder changed outside the file list. */
 export const CACHE_CHANGED = "ss-cache-changed";
 
+/** Broadcast when the app's own download list grows or is cleared. */
+export const DOWNLOADS_CHANGED = "ss-downloads-changed";
+
+const DOWNLOADS_KEY = "ss-downloads";
+const DOWNLOADS_MAX = 200;
+
+/**
+ * Where the files this app pulled landed. The download folder itself is no use
+ * as a list — it is the user's folder and full of other things.
+ */
+export function downloadRecords(): string[] {
+  try {
+    return JSON.parse(localStorage.getItem(DOWNLOADS_KEY) ?? "[]") as string[];
+  } catch {
+    return [];
+  }
+}
+
+export function clearDownloadRecords(): void {
+  localStorage.removeItem(DOWNLOADS_KEY);
+  window.dispatchEvent(new Event(DOWNLOADS_CHANGED));
+}
+
+function rememberDownload(localPath: string): void {
+  const next = [localPath, ...downloadRecords().filter((p) => p !== localPath)].slice(0, DOWNLOADS_MAX);
+  localStorage.setItem(DOWNLOADS_KEY, JSON.stringify(next));
+  window.dispatchEvent(new Event(DOWNLOADS_CHANGED));
+}
+
 export function useFileOpener() {
   const [copies, setCopies] = useState<Map<string, CachedCopy>>(() => new Map());
   const [pull, setPull] = useState<PullState | null>(null);
@@ -263,10 +292,12 @@ export function useFileOpener() {
       setPull({ path: node.path, done: 0, total: node.size });
       mark(node.path, { state: "active", done: 0, error: undefined });
       try {
+        let local: string | null;
         if (isMockMode) {
           await mockTransfer(700);
+          local = `M:\\downloads\\${baseName(node.path)}`;
         } else {
-          await callBackend<string>("pull_file", {
+          local = await callBackend<string>("pull_file", {
             devicePath: node.path,
             size: node.size,
             mtime: node.mtime ?? 0,
@@ -275,6 +306,7 @@ export function useFileOpener() {
           });
         }
         mark(node.path, { state: "done", done: node.size });
+        if (kind === "download" && local) rememberDownload(local);
         if (kind === "cache") {
           setCopies((prev) => {
             const next = new Map(prev);

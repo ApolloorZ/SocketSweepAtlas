@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { callBackend } from "./backend";
 import { formatBytes, formatDate } from "./format";
-import { CANCELLED, estimatedSeconds, type QueueItem } from "./opener";
+import { CANCELLED, clearDownloadRecords, downloadRecords, estimatedSeconds, DOWNLOADS_CHANGED, type QueueItem } from "./opener";
 import { Panel } from "./Panel";
 import { useI18n } from "./i18n";
 
@@ -85,7 +85,8 @@ export function DownloadsPanel({
 
   const refresh = useCallback(async () => {
     try {
-      setFiles(JSON.parse(await callBackend<string>("dir_list", { kind: "download" })) as Downloaded[]);
+      const paths = downloadRecords();
+      setFiles(paths.length === 0 ? [] : (JSON.parse(await callBackend<string>("stat_paths", { paths })) as Downloaded[]));
       const space = JSON.parse(await callBackend<string>("disk_free", { kind: "download" })) as { free: number };
       setFree(space.free);
     } catch (err: unknown) {
@@ -95,6 +96,9 @@ export function DownloadsPanel({
 
   useEffect(() => {
     refresh();
+    const redo = () => void refresh();
+    window.addEventListener(DOWNLOADS_CHANGED, redo);
+    return () => window.removeEventListener(DOWNLOADS_CHANGED, redo);
   }, [refresh]);
 
   // Keep the folder list in step with the batch as it finishes.
@@ -151,9 +155,19 @@ export function DownloadsPanel({
       </section>
 
       <section>
-        <h4 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider mb-1">
-          {t("transfer.folderCount", { count: files.length })}
-        </h4>
+        <div className="flex items-center gap-2 mb-1">
+          <h4 className="text-xs font-semibold text-zinc-500 uppercase tracking-wider flex-1">
+            {t("transfer.folderCount", { count: files.length })}
+          </h4>
+          {files.length > 0 && (
+            <button
+              onClick={() => clearDownloadRecords()}
+              className="text-[11px] text-zinc-500 hover:text-zinc-200 cursor-pointer"
+            >
+              {t("transfer.clearList")}
+            </button>
+          )}
+        </div>
         <div className="rounded-xl border border-zinc-800 bg-zinc-950/40 px-4">
           {files.length === 0 ? (
             <p className="py-4 text-sm text-zinc-600">{t("transfer.folderEmpty")}</p>

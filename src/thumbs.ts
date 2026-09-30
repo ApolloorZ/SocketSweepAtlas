@@ -40,6 +40,15 @@ function base64ToBytes(text: string): Uint8Array {
   return out;
 }
 
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = "";
+  // Chunked because String.fromCharCode(...) spreads its argument over the stack.
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
 function read16(view: DataView, at: number, le: boolean) {
   return view.getUint16(at, le);
 }
@@ -191,7 +200,9 @@ export function thumbFor(node: FileNode): Promise<string | null> {
       const head = base64ToBytes(await callBackend<string>("peek_file", { devicePath: node.path, limit }));
       const bytes = whole ? head : exifThumbnail(head);
       if (!bytes || bytes.length < 512) return null;
-      const url = URL.createObjectURL(new Blob([bytes.slice()], { type: mimeFor(node.name) }));
+      // A data: URI, not URL.createObjectURL: the packaged app's CSP allows
+      // `img-src 'self' data:` and blocks blob:, which dev mode never shows.
+      const url = `data:${mimeFor(node.name)};base64,${bytesToBase64(bytes)}`;
       urls.set(node.path, url);
       return url;
     } catch {

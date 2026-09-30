@@ -121,9 +121,10 @@ export const MESSAGES: Record<string, [zh: string, en: string]> = {
   "transfer.batchActive": ["本次任务 · 进行中 {count}", "This batch · {count} {p:transfer|transfers} running"],
   "transfer.clearDone": ["清除已完成", "Clear finished"],
   "transfer.empty": ["这次还没有传输任务。", "Nothing has been transferred this session."],
-  "transfer.folderCount": ["下载文件夹 · {count} 个文件", "Download folder · {count} {p:file|files}"],
-  "transfer.folderEmpty": ["文件夹还是空的。", "The folder is still empty."],
-  "transfer.folderNote": ["这里的文件不会被自动清理。重名时会自动加 (2)、(3),不覆盖已有文件。", "Nothing here is cleaned up automatically. A name that is taken gets (2), (3) rather than overwriting."],
+  "transfer.folderCount": ["本应用下载 · {count} 个文件", "Downloaded here · {count} {p:file|files}"],
+  "transfer.folderEmpty": ["还没有用这个应用下载过文件。", "Nothing has been downloaded with this app yet."],
+  "transfer.folderNote": ["只列本应用下载的文件,文件夹里原有的不显示。这些文件不会被自动清理;重名时自动加 (2)、(3),不覆盖已有文件。", "Only files this app downloaded appear here — whatever was already in the folder stays out. Nothing is cleaned up automatically; a taken name gets (2), (3) rather than overwriting."],
+  "transfer.clearList": ["清除记录", "Clear list"],
   "transfer.diskFree": ["磁盘剩余 {size}", "{size} free on that disk"],
 
   "queue.queued": ["排队中", "Queued"],

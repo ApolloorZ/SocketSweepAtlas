@@ -744,7 +744,7 @@ export function ResultView({
 
         {(view === "browse" || view === "category") && (
           <div className="px-5 py-3">
-            <div className="grid items-center gap-3 px-3 py-2 border-b border-zinc-800/80 sticky top-0 bg-surface-0/95 backdrop-blur" style={{ gridTemplateColumns: grid }}>
+            <div className="grid items-center gap-3 px-3 py-2 border-b border-zinc-800/80 sticky top-0 z-10 bg-surface-0" style={{ gridTemplateColumns: grid }}>
               <span />
               {headerCell(t("col.name"))}
               {headerCell(t("col.size"), "size")}
