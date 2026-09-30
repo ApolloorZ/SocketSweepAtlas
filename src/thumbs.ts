@@ -6,9 +6,14 @@ import type { FileNode } from "./types";
  * so a row icon can be filled by reading a few dozen kilobytes instead of pulling
  * a 5 MB picture across adb. Anything small enough to just take is taken whole,
  * which also covers PNG and GIF.
+ *
+ * A half-read image never renders, so a file bigger than `DECODE_CAP` is only
+ * ever previewed from its EXIF block — plenty of app-generated images carry no
+ * EXIF at all, and those honestly keep the type icon.
  */
 const HEAD_BYTES = 64 * 1024;
 const WHOLE_FILE_BYTES = 512 * 1024;
+const DECODE_CAP = 2 * 1024 * 1024;
 
 /** adb round trips are not free, and a folder of photos would otherwise fire a
  *  hundred at once the moment it is opened. */
@@ -153,6 +158,20 @@ function mimeFor(name: string): string {
   return "image/jpeg";
 }
 
+/** A phone folder is full of PNGs named .jpg; the bytes decide, not the suffix. */
+function sniffMime(bytes: Uint8Array, name: string): string {
+  const at = (i: number) => bytes[i];
+  if (bytes.length > 12) {
+    if (at(0) === 0x89 && at(1) === 0x50) return "image/png";
+    if (at(0) === 0xff && at(1) === 0xd8) return "image/jpeg";
+    if (at(0) === 0x47 && at(1) === 0x49 && at(2) === 0x46) return "image/gif";
+    if (at(0) === 0x42 && at(1) === 0x4d) return "image/bmp";
+    if (at(0) === 0x52 && at(1) === 0x49 && at(2) === 0x46 && at(3) === 0x46 &&
+        at(8) === 0x57 && at(9) === 0x45 && at(10) === 0x42 && at(11) === 0x50) return "image/webp";
+  }
+  return mimeFor(name);
+}
+
 /** Mock mode has no phone to read, so it draws its own square instead. */
 function mockThumb(node: FileNode): string {
   const canvas = document.createElement("canvas");
@@ -195,14 +214,22 @@ export function thumbFor(node: FileNode): Promise<string | null> {
     }
     await takeSlot();
     try {
-      const whole = node.size > 0 && node.size <= WHOLE_FILE_BYTES;
-      const limit = whole ? WHOLE_FILE_BYTES : HEAD_BYTES;
-      const head = base64ToBytes(await callBackend<string>("peek_file", { devicePath: node.path, limit }));
-      const bytes = whole ? head : exifThumbnail(head);
+      const size = node.size;
+      let bytes: Uint8Array | null;
+      if (size > 0 && size <= WHOLE_FILE_BYTES) {
+        bytes = base64ToBytes(await callBackend<string>("peek_file", { devicePath: node.path, limit: WHOLE_FILE_BYTES }));
+      } else {
+        bytes = exifThumbnail(base64ToBytes(await callBackend<string>("peek_file", { devicePath: node.path, limit: HEAD_BYTES })));
+        if (!bytes && size > 0 && size <= DECODE_CAP) {
+          // No EXIF preview to dig out — a PNG wearing a .jpg name, say. The
+          // only picture left is the file itself, so take it while it is small.
+          bytes = base64ToBytes(await callBackend<string>("peek_file", { devicePath: node.path, limit: size }));
+        }
+      }
       if (!bytes || bytes.length < 512) return null;
       // A data: URI, not URL.createObjectURL: the packaged app's CSP allows
       // `img-src 'self' data:` and blocks blob:, which dev mode never shows.
-      const url = `data:${mimeFor(node.name)};base64,${bytesToBase64(bytes)}`;
+      const url = `data:${sniffMime(bytes, node.name)};base64,${bytesToBase64(bytes)}`;
       urls.set(node.path, url);
       return url;
     } catch {

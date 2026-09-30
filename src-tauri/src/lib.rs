@@ -530,7 +530,9 @@ fn peek_file(app: tauri::AppHandle, device_path: String, limit: u32) -> Result<S
         return Err(err("peek_outside_sdcard"));
     }
     let adb_path = get_bundled_binary(&app, "adb")?;
-    let blocks = (limit / 1024).clamp(1, 512);
+    // 2 MB ceiling: enough for the front end to take a whole PNG when it carries
+    // no EXIF preview, and far short of pulling a real photo across adb.
+    let blocks = (limit / 1024).clamp(1, 2048);
     let command = format!("dd if={} bs=1024 count={} 2>/dev/null", shell_quote(&device_path), blocks);
 
     let mut args: Vec<String> = Vec::new();
