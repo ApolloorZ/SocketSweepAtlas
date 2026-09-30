@@ -23,8 +23,9 @@ fi
 echo "[build] Using NDK: $NDK"
 
 case "$(uname -s)" in
-    Linux*)  HOST_TAG="linux-x86_64"   ;;
-    Darwin*) HOST_TAG="darwin-x86_64"  ;;
+    Linux*)              HOST_TAG="linux-x86_64"   ;;
+    Darwin*)             HOST_TAG="darwin-x86_64"  ;;
+    MINGW*|MSYS*|CYGWIN*) HOST_TAG="windows-x86_64" ;;
     *)       echo "Unsupported host OS"; exit 1 ;;
 esac
 
@@ -40,13 +41,21 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SRC="$SCRIPT_DIR/daemon.cpp"
 OUT="$SCRIPT_DIR/daemon"
 
+# The daemon gzips its own answers, and the NDK's zlib is only a static archive
+# in the sysroot — linking it in keeps the binary self-contained on the phone.
+ZLIB="$TOOLCHAIN/sysroot/usr/lib/aarch64-linux-android/libz.a"
+if [ ! -f "$ZLIB" ]; then
+    echo "[build] no libz.a in the sysroot, falling back to -lz"
+    ZLIB="-lz"
+fi
+
 echo "[build] Compiling daemon.cpp → daemon (aarch64-linux-android) ..."
 
 "$CC" \
     -std=c++17 -O2 -Wall -Wextra -Wpedantic \
     -fno-exceptions -fno-rtti -DNDEBUG \
     -static-libstdc++ \
-    -o "$OUT" "$SRC"
+    -o "$OUT" "$SRC" "$ZLIB"
 
 echo "[build] Output: $OUT  ($(wc -c < "$OUT" | tr -d ' ') bytes)"
 echo "[build] Done."

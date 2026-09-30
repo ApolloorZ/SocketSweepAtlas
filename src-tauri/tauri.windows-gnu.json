@@ -1,0 +1,11 @@
+{
+  "bundle": {
+    "resources": {
+      "bin/adb.exe": "bin/adb.exe",
+      "bin/AdbWinApi.dll": "bin/AdbWinApi.dll",
+      "bin/AdbWinUsbApi.dll": "bin/AdbWinUsbApi.dll",
+      "bin/daemon": "bin/daemon",
+      "webview2/WebView2Loader.dll": "WebView2Loader.dll"
+    }
+  }
+}

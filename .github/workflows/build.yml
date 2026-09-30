@@ -70,6 +70,10 @@ jobs:
           NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
           TOOLCHAIN=$(ls -d "$NDK/toolchains/llvm/prebuilt/"*/ | head -1)
           CC="${TOOLCHAIN}bin/aarch64-linux-android31-clang++"
+          # The daemon gzips its scan answer; the NDK ships zlib as a static
+          # archive in the sysroot, which keeps the binary self-contained.
+          ZLIB="${TOOLCHAIN}sysroot/usr/lib/aarch64-linux-android/libz.a"
+          [ -f "$ZLIB" ] || ZLIB="-lz"
 
           echo "NDK: $NDK"
           echo "Compiler: $CC"
@@ -78,7 +82,7 @@ jobs:
             -std=c++17 -O2 -Wall -Wextra -Wpedantic \
             -fno-exceptions -fno-rtti -DNDEBUG \
             -static-libstdc++ \
-            -o src-tauri/bin/daemon engine/daemon.cpp
+            -o src-tauri/bin/daemon engine/daemon.cpp "$ZLIB"
 
           file src-tauri/bin/daemon
           echo "✓ C++ daemon cross-compiled for Android aarch64"
@@ -90,6 +94,8 @@ jobs:
           $NDK = $env:ANDROID_NDK_LATEST_HOME
           $Prebuilt = Get-ChildItem "$NDK\toolchains\llvm\prebuilt" -Directory | Select-Object -First 1
           $CC = Join-Path $Prebuilt.FullName "bin\aarch64-linux-android31-clang++.cmd"
+          $ZLIB = Join-Path $Prebuilt.FullName "sysroot\usr\lib\aarch64-linux-android\libz.a"
+          if (-not (Test-Path $ZLIB)) { $ZLIB = "-lz" }
 
           Write-Host "NDK: $NDK"
           Write-Host "Compiler: $CC"
@@ -98,7 +104,7 @@ jobs:
             -std=c++17 -O2 -Wall -Wextra -Wpedantic `
             -fno-exceptions -fno-rtti -DNDEBUG `
             -static-libstdc++ `
-            -o src-tauri/bin/daemon engine/daemon.cpp
+            -o src-tauri/bin/daemon engine/daemon.cpp $ZLIB
 
           Write-Host "✓ C++ daemon cross-compiled for Android aarch64"
 
