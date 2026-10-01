@@ -51,7 +51,7 @@ pub(crate) fn err_arg(code: &str, arg: impl std::fmt::Display) -> String {
 use tauri::Manager;
 
 pub(crate) fn get_bundled_binary(app: &tauri::AppHandle, name: &str) -> Result<std::path::PathBuf, String> {
-    let resource_dir = app.path().resource_dir().map_err(|e| format!("Failed to get resource dir: {}", e))?;
+    let resource_dir = app.path().resource_dir().map_err(|e| err_arg("resource_dir", e))?;
 
     // On Windows, host-native binaries like ADB use a .exe extension.
     // Try the .exe variant first, then fall back to the extensionless name
@@ -68,7 +68,7 @@ pub(crate) fn get_bundled_binary(app: &tauri::AppHandle, name: &str) -> Result<s
     if path.exists() {
         Ok(path)
     } else {
-        Err(format!("Bundled binary '{}' not found at {:?}", name, path))
+        Err(err_arg("binary_missing", format!("{name} ({path:?})")))
     }
 }
 
@@ -96,7 +96,7 @@ pub(crate) fn adb(adb_path: &std::path::Path, args: &[&str]) -> Result<String, S
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to execute adb binary at {:?}: {}", adb_path, e))?;
+        .map_err(|e| err_arg("adb_exec", format!("{adb_path:?}: {e}")))?;
 
     let mut stdout_pipe = child.stdout.take().unwrap();
     let mut stderr_pipe = child.stderr.take().unwrap();
@@ -119,14 +119,14 @@ pub(crate) fn adb(adb_path: &std::path::Path, args: &[&str]) -> Result<String, S
     let status;
 
     loop {
-        if let Some(s) = child.try_wait().map_err(|e| format!("Failed to wait on adb process: {}", e))? {
+        if let Some(s) = child.try_wait().map_err(|e| err_arg("adb_wait", e))? {
             status = s;
             break;
         }
         if start.elapsed() > timeout {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("ADB command timed out after {} seconds. Please reconnect your device and try again.", timeout_secs));
+            return Err(err_arg("adb_timeout", timeout_secs));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -140,16 +140,12 @@ pub(crate) fn adb(adb_path: &std::path::Path, args: &[&str]) -> Result<String, S
     if !status.success() {
         let combined = format!("{stdout} {stderr}").to_lowercase();
         if combined.contains("no devices") || combined.contains("device not found") {
-            return Err("No Android device detected. Connect your phone via USB and enable USB Debugging.".into());
+            return Err(err("no_usb_device"));
         }
         if combined.contains("unauthorized") {
-            return Err("USB Debugging not authorised. Check the confirmation dialog on your phone.".into());
+            return Err(err("adb_unauthorized"));
         }
-        return Err(format!(
-            "adb {} failed (exit {}):\n{stderr}",
-            args.join(" "),
-            status.code().unwrap_or(-1)
-        ));
+        return Err(err_arg("adb_failed", format!("{} (exit {}): {}", args.join(" "), status.code().unwrap_or(-1), stderr.trim())));
     }
 
     Ok(stdout)
@@ -193,12 +189,12 @@ fn daemon_command(cmd: &str) -> Result<String, String> {
         &DAEMON_ADDR.parse().unwrap(),
         TCP_CONNECT_TIMEOUT,
     )
-    .map_err(|e| format!("Cannot connect to daemon at {DAEMON_ADDR}: {e}"))?;
+    .map_err(|e| err_arg("daemon_connect", e))?;
     let connected = started.elapsed();
 
     stream
         .set_read_timeout(Some(TCP_READ_TIMEOUT))
-        .map_err(|e| format!("Failed to set read timeout: {e}"))?;
+        .map_err(|e| err_arg("daemon_timeout", e))?;
 
     let payload = if cmd.ends_with('\n') {
         cmd.to_string()
@@ -207,13 +203,13 @@ fn daemon_command(cmd: &str) -> Result<String, String> {
     };
     stream
         .write_all(payload.as_bytes())
-        .map_err(|e| format!("Failed to send command to daemon: {e}"))?;
+        .map_err(|e| err_arg("daemon_send", e))?;
     let sent = started.elapsed();
 
     let mut response_bytes = Vec::with_capacity(1024 * 1024);
     stream
         .read_to_end(&mut response_bytes)
-        .map_err(|e| format!("Failed to read daemon response: {e}"))?;
+        .map_err(|e| err_arg("daemon_read", e))?;
     let read = started.elapsed();
 
     // The scan answer arrives gzipped: the phone produces it far faster than the
@@ -415,16 +411,16 @@ fn get_storage_info(app: tauri::AppHandle) -> Result<String, String> {
 
     let cols: Vec<&str> = row.split_whitespace().collect();
     if cols.len() < 4 {
-        return Err(format!("Failed to read device storage capacity: unparsable df row '{row}'"));
+        return Err(err_arg("storage_df", format!("unparsable row '{row}'")));
     }
     if !header_kb {
-        return Err(format!("Failed to read device storage capacity: df did not report 1K blocks ({row})"));
+        return Err(err_arg("storage_df", format!("df did not report 1K blocks ({row})")));
     }
 
     let parse_kb = |v: &str| -> Result<i64, String> {
         v.parse::<i64>()
             .map(|kb| kb * 1024)
-            .map_err(|e| format!("Failed to read device storage capacity: bad value '{v}' ({e})"))
+            .map_err(|e| err_arg("storage_df", format!("bad value '{v}' ({e})")))
     };
 
     Ok(format!(
@@ -566,7 +562,7 @@ fn local_file_sizes(paths: Vec<String>) -> Result<String, String> {
             serde_json::json!({ "path": path, "bytes": bytes })
         })
         .collect();
-    serde_json::to_string(&out).map_err(|e| format!("Failed to report file sizes: {e}"))
+    serde_json::to_string(&out).map_err(|e| err_arg("encode_failed", e))
 }
 
 /// Stats the files this app pulled, newest first. The download folder is the
@@ -812,7 +808,7 @@ fn list_devices(app: tauri::AppHandle) -> Result<String, String> {
         group.kind = if pairing::is_wireless_serial(&group.serial) { "wireless".into() } else { "usb".into() };
     }
 
-    serde_json::to_string(&groups).map_err(|e| format!("Failed to describe devices: {e}"))
+    serde_json::to_string(&groups).map_err(|e| err_arg("encode_failed", e))
 }
 
 #[tauri::command(async)]
@@ -871,7 +867,7 @@ fn default_root(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     }
     app.path()
         .app_cache_dir()
-        .map_err(|e| format!("Failed to locate a local folder: {e}"))
+        .map_err(|e| err_arg("folder_pick", e))
         .map(|dir| dir.join("socketsweep"))
 }
 
@@ -1253,7 +1249,7 @@ fn pull_file(
     };
     let local_str = local
         .to_str()
-        .ok_or_else(|| format!("Local path is not valid text: {:?}", local))?
+        .ok_or_else(|| err_arg("path_not_text", local.display()))?
         .to_string();
 
     // A copy is only reusable when it matches both the size and the phone's own
@@ -1287,7 +1283,7 @@ fn pull_file(
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| format!("Failed to start adb pull: {e}"))?;
+            .map_err(|e| err_arg("pull_start_failed", e))?;
 
         wait_for_transfer(
             &app,
@@ -1329,7 +1325,7 @@ fn reveal_folder(app: tauri::AppHandle, kind: String) -> Result<String, String> 
     let dir = dir_for(&app, &kind)?;
     let path = dir
         .to_str()
-        .ok_or_else(|| format!("Path is not valid text: {:?}", dir))?
+        .ok_or_else(|| err_arg("path_not_text", dir.display()))?
         .to_string();
     app.opener()
         .open_path(&path, None::<&str>)
@@ -1358,7 +1354,7 @@ fn cancel_qr_pairing() -> Result<String, String> {
 fn wireless_auto_connect(app: tauri::AppHandle) -> Result<String, String> {
     let adb_path = get_bundled_binary(&app, "adb")?;
     let result = pairing::auto_connect(&adb_path)?;
-    serde_json::to_string(&result).map_err(|e| format!("Failed to report devices: {e}"))
+    serde_json::to_string(&result).map_err(|e| err_arg("encode_failed", e))
 }
 
 // ── Tauri entry point ───────────────────────────────────────────────────────
