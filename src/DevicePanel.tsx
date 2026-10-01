@@ -100,6 +100,19 @@ export function DevicePanel({
     refresh();
   }, [refresh]);
 
+  // The device list changes underneath this window: the phone can pair, drop or
+  // re-announce itself over mDNS while it is open, and a list frozen at the
+  // moment of opening reads as "no phone found". Quietly keep it current; the
+  // manual button stays for when nobody wants to wait three seconds.
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      callBackend<string>("list_devices")
+        .then((raw) => setDevices(JSON.parse(raw) as DeviceInfo[]))
+        .catch(() => undefined);
+    }, 3000);
+    return () => window.clearInterval(id);
+  }, []);
+
   // The LAN search handed us the pairing endpoint it overheard, so only the
   // digits on the phone's screen are left to type.
   useEffect(() => {
