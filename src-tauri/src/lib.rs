@@ -295,11 +295,9 @@ fn init_daemon(app: tauri::AppHandle, serial: Option<String>) -> Result<String, 
             Some((serial, _)) => serial.clone(),
             None => {
                 if available.iter().any(|(_, status)| status == "unauthorized") {
-                    return Err("USB Debugging not authorised. Check the confirmation dialog on your phone.".into());
+                    return Err(err("adb_unauthorized"));
                 }
-                return Err(
-                    "No Android device detected. Connect your phone via USB and enable USB Debugging.".into(),
-                );
+                return Err(err("no_usb_device"));
             }
         },
     };
@@ -349,7 +347,7 @@ fn init_daemon(app: tauri::AppHandle, serial: Option<String>) -> Result<String, 
     }
 
     if !connected_daemon {
-        return Err("Daemon started but failed to respond to PING over TCP tunnel.".into());
+        return Err(err("daemon_no_ping"));
     }
 
     Ok(format!(
@@ -437,7 +435,7 @@ fn delete_item(path: String) -> Result<String, String> {
     if let Ok(root) = SCAN_ROOT.lock() {
         if let Some(ref scan_root) = *root {
             if path == *scan_root {
-                return Err("Cannot delete the scan root directory.".into());
+                return Err(err("delete_scan_root"));
             }
         }
     }
