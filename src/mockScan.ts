@@ -121,6 +121,13 @@ export function mockScanResponse(): ScanResponse {
     total_dirs: counts.dirs,
     total_size: tree.size,
     errors: 37,
+    // A modern daemon reports these; the mock plays along so the log line has
+    // something to show in the browser harness.
+    traverse_ms: 7980,
+    sort_ms: 120,
+    serialize_ms: 260,
+    send_ms: 61,
+    bytes_sent: 9 * 1024 * 1024,
     tree,
   };
 }

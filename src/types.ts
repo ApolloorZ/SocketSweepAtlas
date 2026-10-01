@@ -20,6 +20,13 @@ export interface ScanResponse {
   total_dirs: number;
   total_size: number;
   errors: number;
+  /** The phone's own phase breakdown; absent from a daemon that predates it. */
+  traverse_ms?: number;
+  sort_ms?: number;
+  serialize_ms?: number;
+  send_ms?: number;
+  /** Bytes handed to the socket — the compressed answer, not the tree. */
+  bytes_sent?: number;
   tree: FileNode;
 }
 

@@ -689,6 +689,17 @@ function App() {
         });
       });
       addLog("log.scanDone", { files: formatNumber(parsed.total_files), ms: parsed.scan_time_ms });
+      // The phone measures its own phases; a daemon too old to report them just
+      // stays quiet rather than printing a line of zeros.
+      if (parsed.traverse_ms !== undefined) {
+        addLog("log.scanPhases", {
+          traverse: parsed.traverse_ms,
+          sort: parsed.sort_ms ?? 0,
+          write: parsed.serialize_ms ?? 0,
+          send: parsed.send_ms ?? 0,
+          wire: ((parsed.bytes_sent ?? 0) / 1048576).toFixed(1),
+        });
+      }
     } catch (err: unknown) {
       if (stale()) return;
       failFlow(err instanceof Error ? err.message : String(err));
@@ -717,6 +728,17 @@ function App() {
       setScanData(parsed);
       setPhase("result");
       addLog("log.scanDone", { files: formatNumber(parsed.total_files), ms: parsed.scan_time_ms });
+      // The phone measures its own phases; a daemon too old to report them just
+      // stays quiet rather than printing a line of zeros.
+      if (parsed.traverse_ms !== undefined) {
+        addLog("log.scanPhases", {
+          traverse: parsed.traverse_ms,
+          sort: parsed.sort_ms ?? 0,
+          write: parsed.serialize_ms ?? 0,
+          send: parsed.send_ms ?? 0,
+          wire: ((parsed.bytes_sent ?? 0) / 1048576).toFixed(1),
+        });
+      }
     } catch (err: unknown) {
       if (stale()) return;
       const message = err instanceof Error ? err.message : String(err);
