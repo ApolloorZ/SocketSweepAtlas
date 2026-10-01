@@ -40,6 +40,15 @@ static volatile sig_atomic_t g_running = 1;
 static void on_signal(int) { g_running = 0; }
 static std::string g_scan_root;  // tracks the active scan root for delete validation
 
+// Per-phase scan timing, reset at the start of every scan. `send` is measured
+// where bytes are actually handed to the socket, so with compression on it
+// counts the compressed answer — which is the only number the tunnel cares about.
+static int64_t g_sort_ns    = 0;
+static int64_t g_send_ns    = 0;
+static int64_t g_send_bytes = 0;
+
+static inline int64_t ns_to_ms(int64_t ns) { return ns / 1000000; }
+
 // ── Delete path validation ──────────────────────────────────────────────────
 
 /// Returns true if `target` is strictly inside `root` (component-wise).
@@ -86,14 +95,19 @@ class JsonStream {
     bool broken = false;
 
     static bool send_all(int fd, const char* p, size_t left) {
+        const size_t total = left;
+        const auto t0 = std::chrono::steady_clock::now();
         while (left > 0) {
             ssize_t n = ::send(fd, p, left, MSG_NOSIGNAL);
             if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) return false;
+            if (n <= 0) break;
             p    += n;
             left -= static_cast<size_t>(n);
         }
-        return true;
+        g_send_ns    += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+        g_send_bytes += total - left;
+        return left == 0;
     }
 
     bool send_out(const char* p, size_t len) {
@@ -103,7 +117,9 @@ class JsonStream {
     }
 
     // Pushes whatever is buffered through deflate and sends what came out.
-    bool pump(bool final) {
+    // `sync` additionally asks deflate to emit everything it is holding back,
+    // which is what a byte count taken mid-answer needs in order to be true.
+    bool pump(bool final, bool sync = false) {
         if (buf.empty() && !final) return true;
         zs.next_in  = reinterpret_cast<Bytef*>(const_cast<char*>(buf.data()));
         zs.avail_in = static_cast<uInt>(buf.size());
@@ -112,7 +128,7 @@ class JsonStream {
         do {
             zs.next_out  = reinterpret_cast<Bytef*>(outbuf);
             zs.avail_out = static_cast<uInt>(sizeof(outbuf));
-            rc = deflate(&zs, final ? Z_FINISH : Z_NO_FLUSH);
+            rc = deflate(&zs, final ? Z_FINISH : (sync ? Z_SYNC_FLUSH : Z_NO_FLUSH));
             size_t produced = sizeof(outbuf) - zs.avail_out;
             if (produced > 0 && !send_out(outbuf, produced)) return false;
             if (rc == Z_BUF_ERROR) break;
@@ -171,6 +187,13 @@ public:
     /// False once a send has failed: the answer is incomplete and must not be
     /// presented as if it were good.
     bool ok() const { return !broken; }
+
+    /// Drains the compressor without closing the gzip member, so a measurement
+    /// taken next covers everything written so far.
+    bool sync() {
+        if (!gz_on) return flush();
+        return pump(false, true);
+    }
 
     /// Closes the gzip member so the reader gets a valid trailer.
     bool finish() {
@@ -337,10 +360,13 @@ static FileNode scan(const std::string& path, const std::string& name,
     }
     ::closedir(dir);
 
+    const auto sort_t0 = std::chrono::steady_clock::now();
     std::sort(node.children.begin(), node.children.end(),
               [](const FileNode& a, const FileNode& b) {
                   return a.size > b.size;
               });
+    g_sort_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - sort_t0).count();
 
     return node;
 }
@@ -406,17 +432,25 @@ static void handle_client(int fd) {
         // scan is acceptable, a broken one is not.
         if (!out.gzip_start()) std::fprintf(stderr, "[engine] gzip unavailable, sending plain\n");
 
+        g_sort_ns    = 0;
+        g_send_ns    = 0;
+        g_send_bytes = 0;
+
         auto t0 = std::chrono::steady_clock::now();
         ScanStats stats{};
         FileNode tree = scan(root, root_name, stats, 0);
         auto t1 = std::chrono::steady_clock::now();
         int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        int64_t traverse_ms = ms - ns_to_ms(g_sort_ns);
+        if (traverse_ms < 0) traverse_ms = 0;
 
         std::fprintf(stderr, "[engine] Done: %lld files, %lld dirs, "
-                     "%lld bytes, %lld errors, %lld ms\n",
+                     "%lld bytes, %lld errors, %lld ms "
+                     "(traverse %lld ms, sort %lld ms)\n",
                      (long long)stats.files, (long long)stats.dirs,
                      (long long)stats.total_size, (long long)stats.errors,
-                     (long long)ms);
+                     (long long)ms, (long long)traverse_ms,
+                     (long long)ns_to_ms(g_sort_ns));
 
         out.write("{\"status\":\"ok\",\"scan_time_ms\":");
         out.write(std::to_string(ms));
@@ -430,6 +464,28 @@ static void handle_client(int fd) {
         out.write(std::to_string(stats.errors));
         out.write(",\"tree\":");
         serialize_node(out, tree);
+
+        // The phase numbers can only be taken once the tree has gone out, and
+        // most of it is still inside the compressor's buffer at this point.
+        // sync() pushes that buffer through deflate *and* asks it to emit what
+        // it is holding back, without closing the gzip member — finish() does
+        // that once the answer is complete — so the counters below cover the
+        // whole payload and the reader still gets one well-formed stream.
+        out.sync();
+        const auto t2 = std::chrono::steady_clock::now();
+        const int64_t serialize_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+        const int64_t send_ms      = ns_to_ms(g_send_ns);
+
+        out.write(",\"traverse_ms\":");
+        out.write(std::to_string(traverse_ms));
+        out.write(",\"sort_ms\":");
+        out.write(std::to_string(ns_to_ms(g_sort_ns)));
+        out.write(",\"serialize_ms\":");
+        out.write(std::to_string(serialize_ms));
+        out.write(",\"send_ms\":");
+        out.write(std::to_string(send_ms));
+        out.write(",\"bytes_sent\":");
+        out.write(std::to_string(g_send_bytes));
         out.write("}\n");
     }
     else {

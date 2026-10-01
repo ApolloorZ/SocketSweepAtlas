@@ -55,6 +55,7 @@ echo "[build] Compiling daemon.cpp → daemon (aarch64-linux-android) ..."
     -std=c++17 -O2 -Wall -Wextra -Wpedantic \
     -fno-exceptions -fno-rtti -DNDEBUG \
     -static-libstdc++ \
+    -s \
     -o "$OUT" "$SRC" "$ZLIB"
 
 echo "[build] Output: $OUT  ($(wc -c < "$OUT" | tr -d ' ') bytes)"

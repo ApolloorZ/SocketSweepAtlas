@@ -13,7 +13,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Linux builds on the oldest still-supported Ubuntu LTS so the
+          # bundled glibc requirement stays low (2.35 on jammy) and the
+          # AppImage runs on older distributions — required by the AppImage
+          # catalog ("error-glibc-too-new" otherwise).
+          - os: ubuntu-22.04
             platform: linux
             adb_url: https://dl.google.com/android/repository/platform-tools-latest-linux.zip
           - os: macos-latest
@@ -57,6 +61,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
+          # Per-image cache: artifacts restored across different runner
+          # images (e.g. 24.04 -> 22.04) can be silently stale and fail
+          # with E0463 "can't find crate" despite matching fingerprints.
+          key: ${{ matrix.os }}
 
       - name: Install frontend dependencies
         run: npm ci
@@ -70,8 +78,9 @@ jobs:
           NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
           TOOLCHAIN=$(ls -d "$NDK/toolchains/llvm/prebuilt/"*/ | head -1)
           CC="${TOOLCHAIN}bin/aarch64-linux-android31-clang++"
-          # The daemon gzips its scan answer; the NDK ships zlib as a static
-          # archive in the sysroot, which keeps the binary self-contained.
+          # The daemon gzips its scan answer, and the NDK carries zlib only as a
+          # static archive in the sysroot; linking that keeps the binary
+          # self-contained on the phone.
           ZLIB="${TOOLCHAIN}sysroot/usr/lib/aarch64-linux-android/libz.a"
           [ -f "$ZLIB" ] || ZLIB="-lz"
 
@@ -82,6 +91,7 @@ jobs:
             -std=c++17 -O2 -Wall -Wextra -Wpedantic \
             -fno-exceptions -fno-rtti -DNDEBUG \
             -static-libstdc++ \
+            -s \
             -o src-tauri/bin/daemon engine/daemon.cpp "$ZLIB"
 
           file src-tauri/bin/daemon
@@ -104,6 +114,7 @@ jobs:
             -std=c++17 -O2 -Wall -Wextra -Wpedantic `
             -fno-exceptions -fno-rtti -DNDEBUG `
             -static-libstdc++ `
+            -s `
             -o src-tauri/bin/daemon engine/daemon.cpp $ZLIB
 
           Write-Host "✓ C++ daemon cross-compiled for Android aarch64"
@@ -173,6 +184,117 @@ jobs:
       # platform installers (.dmg / .deb / .AppImage / .msi / .exe).
       - name: Build Tauri app
         run: npm run tauri build
+
+      # ── Fix AppImage: guarantee root icon + .DirIcon + sane modes ─────────
+      # Required for AppImage catalog validation. tauri-bundler 2.11.1 emits a
+      # .DirIcon whose target is an ABSOLUTE path into the build machine
+      # (dangling everywhere else — the .desktop symlink IS relative since
+      # bundler 2.9.4, but .DirIcon is not fixed), and its AppDir carries
+      # root-only directory modes (0700 dirs, 0770 AppRun.wrapped) that make
+      # the packed image unexecutable for non-root users. We extract, fix the
+      # root icon + .DirIcon + permissions, repack with a pinned
+      # checksum-verified appimagetool, and verify the stored squashfs modes.
+      - name: Fix AppImage - inject .DirIcon
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+
+          APPIMAGE=$(find src-tauri/target/release/bundle/appimage -name "*.AppImage" | head -1)
+          [ -n "$APPIMAGE" ] || { echo "::error::No AppImage found in src-tauri/target/release/bundle/appimage"; exit 1; }
+          echo "Patching: $APPIMAGE"
+
+          # The AppImage runtime itself handles extraction (no FUSE needed).
+          # --appimage-extract always outputs to ./squashfs-root/
+          chmod +x "$APPIMAGE"
+          "$APPIMAGE" --appimage-extract
+          APPDIR="$(pwd)/squashfs-root"
+
+          echo "AppDir contents:"
+          ls -la "$APPDIR"
+
+          # Guarantee the root icon (.DirIcon must resolve to a real file).
+          # Prefer the productName-named png (matches Icon= in the desktop
+          # file); the bundler may also place one named after the binary
+          # (tauri-app.png), which find would otherwise pick first.
+          ICON=$(find "$APPDIR" -maxdepth 1 -name "SocketSweep.png" | head -1)
+          if [ -z "$ICON" ]; then
+            ICON=$(find "$APPDIR" -maxdepth 1 -name "*.png" | head -1)
+          fi
+          if [ -z "$ICON" ]; then
+            cp src-tauri/icons/128x128.png "$APPDIR/SocketSweep.png"
+            ICON="$APPDIR/SocketSweep.png"
+          fi
+          ICON_NAME=$(basename "$ICON")
+          echo "Linking .DirIcon -> $ICON_NAME"
+          ln -sf "$ICON_NAME" "$APPDIR/.DirIcon"
+
+          # Normalize permissions before repacking. The AppDir produced by
+          # tauri-bundler 2.11.1 contains root-only directory modes (AppDir
+          # root, usr/ and apprun-hooks/ are 0700; AppRun.wrapped is 0770).
+          # Squashfs preserves them, so the app is unexecutable for every
+          # non-root user — the AppImage catalog's firejail run fails with
+          # "AppRun: Permission denied" and desktop users would hit the same.
+          # Dirs must be traversable, everything readable, and binaries,
+          # libraries, resources (usr/bin, usr/lib incl. bundled adb/daemon)
+          # and AppRun hooks executable.
+          find "$APPDIR" -type d -exec chmod 755 {} +
+          find "$APPDIR" -type f -exec chmod 644 {} +
+          chmod 755 "$APPDIR/AppRun"
+          if [ -e "$APPDIR/AppRun.wrapped" ]; then
+            chmod 755 "$APPDIR/AppRun.wrapped"
+          fi
+          if [ -d "$APPDIR/apprun-hooks" ]; then
+            find "$APPDIR/apprun-hooks" -type f -exec chmod 755 {} +
+          fi
+          find "$APPDIR/usr/bin" "$APPDIR/usr/lib" -type f -exec chmod 755 {} +
+
+          # Assert the modes we control on-disk before packing. mksquashfs
+          # stores disk modes verbatim, so these are what the image carries.
+          assert_mode() { [ "$(stat -c '%a' "$2")" = "$1" ] || { echo "::error::$2 mode is $(stat -c '%a' "$2"), expected $1"; exit 1; }; }
+          assert_mode 755 "$APPDIR"
+          assert_mode 755 "$APPDIR/usr"
+          assert_mode 755 "$APPDIR/AppRun"
+          if [ -e "$APPDIR/AppRun.wrapped" ]; then
+            assert_mode 755 "$APPDIR/AppRun.wrapped"
+          fi
+          assert_mode 755 "$APPDIR/usr/lib/SocketSweep/bin/adb"
+          assert_mode 755 "$APPDIR/usr/lib/SocketSweep/bin/daemon"
+
+          # Download appimagetool for repacking — pinned to 1.9.1 and
+          # checksum-verified (GitHub "continuous" builds are unpinned, and
+          # AppImageKit's own releases are marked obsolete).
+          # Use --appimage-extract-and-run because GitHub Actions has no FUSE.
+          curl -fsSL -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | shasum -a 256 -c -
+          chmod +x appimagetool
+
+          # Repack in place, replacing the original AppImage.
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run "$APPDIR" "$APPIMAGE"
+
+          # Verify the repacked image the way the AppImage catalog does:
+          # .DirIcon (and the root .desktop, when present) must resolve —
+          # test -e follows symlinks, so dangling ones fail here in CI
+          # instead of in the catalog PR.
+          # Verify the packed image by re-extracting and resolving the root
+          # symlinks. Note: the runtime extractor creates ALL directories as
+          # 0700 regardless of stored modes and umask (proven empirically), so
+          # extracted dir modes are meaningless here — the stored dir modes are
+          # guaranteed by the pre-pack assertions above plus mksquashfs storing
+          # disk modes verbatim, and are spot-checked with 7z on the uploaded
+          # asset outside CI.
+          rm -rf squashfs-root
+          "$APPIMAGE" --appimage-extract >/dev/null
+          [ -e "$APPDIR/.DirIcon" ] || { echo "::error::.DirIcon is dangling after repack"; exit 1; }
+          echo ".DirIcon -> $(readlink "$APPDIR/.DirIcon") (resolves OK)"
+          DESKTOP=$(find "$APPDIR" -maxdepth 1 -name "*.desktop" | head -1)
+          if [ -n "$DESKTOP" ] && [ ! -e "$DESKTOP" ]; then
+            echo "::error::Root .desktop symlink is dangling after repack"
+            exit 1
+          fi
+
+          rm -rf squashfs-root appimagetool
+          echo "✓ AppImage patched with .DirIcon and verified"
 
       # ── Upload release artifacts ──────────────────────────────────────────
       - name: Upload macOS artifacts
