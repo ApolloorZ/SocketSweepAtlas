@@ -24,6 +24,24 @@
 
 ---
 
+## 🔧 About this fork
+
+This is a **modified version** of [SocketSweep](https://github.com/VishnuSrivatsava/SocketSweep) by Vishnu Srivatsava, released under the same **GPL-3.0** license — see [LICENSE](LICENSE). It started from upstream `main` at commit `bedcb60` (the v1.1.0 line) and also carries upstream's later fixes; the list below is what *this* fork changed.
+
+The goal was to make it something you leave open while clearing a phone, not a demo you run once:
+
+- **The whole interface in Chinese or English**, switchable in Settings and remembered on the machine — *including every backend failure*, which now travels to the front end as an error code and is worded there, so an English user never sees Chinese system text or the reverse.
+- **A file list built for daily use**: four-column table, sortable, searchable, select-all, drag-to-paint selection that scrolls itself when you reach the edge, breadcrumbs, a per-row share tint (colour and on/off in Settings), and image previews dug out of each photo's own EXIF thumbnail.
+- **Both directions**: upload by button or by dragging files in, move files inside the phone, and stop a running transfer — a stopped transfer leaves no half-written file on either side. Free space is checked on the PC *and* on the phone before any byte moves.
+- **Wireless first**: QR pairing, a three-step fallback when the LAN search finds nothing, and one row per phone even when it is plugged in *and* paired over Wi-Fi.
+- **Roughly three times faster over wireless adb.** The phone gzips its own answer (57 MB of repeated paths becomes 9 MB) and the Rust bridge stopped copying the payload three times. Measured on a Redmi K40, 250,000 files: **~74 s → 21–35 s**.
+- **Failures are visible now.** A tunnel that drops mid-scan is reported instead of silently arriving short; commands that talk to the phone run off the UI thread; nothing opens a console window per adb call any more.
+- The log panel prints the phone's own phase breakdown — traverse, sort, write, send, compressed size — so a slow scan says where the time actually went.
+
+Deleting still asks first, and the cache of files you opened lives on the PC, separate from anything on the phone.
+
+---
+
 ## 😤 The Problem
 
 Ever plugged your Android phone into your PC to figure out what's eating all your storage?
@@ -70,13 +88,20 @@ For comparison, doing the same thing over MTP (plugging in the phone and browsin
 ## 🚀 How to Use
 
 ### 1. Download
-**[Download SocketSweep v1.0.0](https://github.com/VishnuSrivatsava/SocketSweep/releases/tag/v1.0.0)**
+
+This fork builds its packages with the same CI workflow, so they live in this repository's releases — [latest release](releases/latest):
 
 | Platform | Download |
 |----------|----------|
-| 🪟 **Windows** | [Installer (.exe)](https://github.com/VishnuSrivatsava/SocketSweep/releases/tag/v1.0.0) · [Enterprise (.msi)](https://github.com/VishnuSrivatsava/SocketSweep/releases/tag/v1.0.0) |
-| 🍎 **macOS** (Apple Silicon) | [Disk Image (.dmg)](https://github.com/VishnuSrivatsava/SocketSweep/releases/tag/v1.0.0) |
-| 🐧 **Linux** | [AppImage](https://github.com/VishnuSrivatsava/SocketSweep/releases/tag/v1.0.0) · [.deb](https://github.com/VishnuSrivatsava/SocketSweep/releases/tag/v1.0.0) |
+| 🪟 **Windows** | [Installer (.exe)](releases/latest) · [Enterprise (.msi)](releases/latest) |
+| 🍎 **macOS** (Apple Silicon) | [Disk Image (.dmg)](releases/latest) |
+| 🐧 **Linux** | [AppImage](releases/latest) · [.deb](releases/latest) |
+
+The original project's [v1.1.1 packages are here](https://github.com/VishnuSrivatsava/SocketSweep/releases/tag/v1.1.1).
+
+> **Windows note:** these builds are not code-signed, so SmartScreen may show *"Windows protected your PC"* — click *More info* → *Run anyway*.
+
+> **Arch/AUR note:** The [`socketsweep-bin`](https://aur.archlinux.org/packages/socketsweep-bin) package is currently unmaintained and its checksum check fails until an adopter bumps it to v1.1.1. In the meantime, Arch users can install the .deb directly: `sudo pacman -U SocketSweep_1.1.1_amd64.deb`
 
 > **macOS note:** Since the build is ad-hoc signed, run this once after installing:
 > ```bash
@@ -207,6 +232,18 @@ npm run tauri dev
 ```
 *Ensure your Android device is plugged in via USB and **USB Debugging** is enabled.*
 
+### Fork build notes
+
+Three things differ from the steps above when building this fork:
+
+1. **The daemon needs zlib.** It gzips its own answer, so `engine/build.sh` links the NDK's static `libz.a` (falling back to `-lz`) and strips the binary. It also runs under Git Bash on Windows, not just Linux/macOS.
+2. **Windows binaries are not in the repository.** `src-tauri/bin/adb.exe`, `AdbWinApi.dll`, `AdbWinUsbApi.dll` and `src-tauri/webview2/WebView2Loader.dll` are gitignored — copy the first three out of Google's platform-tools. The loader is needed because a GNU-toolchain build links it dynamically, so an installer without it dies at load time with `STATUS_DLL_NOT_FOUND`.
+3. **Bundle on Windows with the overlay config**, which is what keeps the shared `tauri.conf.json` valid for Linux and macOS:
+   ```bash
+   npm run tauri build -- --bundles nsis --config src-tauri/tauri.windows-gnu.json
+   ```
+   `src-tauri/Cargo.toml` also pins `crate-type = ["rlib"]`: the mobile `cdylib`/`staticlib` targets make the Windows GNU linker emit an export table it cannot handle (*export ordinal too large*). An MSVC build does not need this.
+
 ---
 
 ## 🛠 Troubleshooting
@@ -242,6 +279,22 @@ If SocketSweep saved you from the nightmare of MTP, consider supporting its deve
   &nbsp;&nbsp;
   <a href="https://paypal.me/mathcuber"><img src="https://img.shields.io/badge/PayPal-00457C?style=for-the-badge&logo=paypal&logoColor=white" alt="PayPal" /></a>
 </div>
+
+---
+
+## 📦 Third-party components
+
+An installed copy carries more than this repository's source, and each piece keeps its own terms:
+
+| Component | Licence | Where it ends up |
+|---|---|---|
+| `adb` (Android platform-tools, Google) | Apache-2.0 | next to the app; used to reach the phone |
+| `WebView2Loader.dll` (Microsoft) | Microsoft WebView2 distribution terms | next to the executable in Windows builds |
+| zlib, **statically linked into the phone daemon** | zlib licence (GPL-compatible) | inside `src-tauri/bin/daemon` |
+| Inter, JetBrains Mono | SIL Open Font License 1.1 | embedded in the front end and served from the app rather than a CDN; the licence text is kept in [`licenses/`](licenses) |
+| Tauri 2, React 19, Recharts | MIT / Apache-2.0 | the desktop shell and the UI |
+
+The complete corresponding source for any build of this fork is this repository at the commit that build came from.
 
 ---
 
