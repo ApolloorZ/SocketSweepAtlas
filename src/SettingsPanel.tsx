@@ -156,9 +156,11 @@ export function SettingsPanel({
   const { t } = useI18n();
   const [cache, setCache] = useState<DirStats | null>(null);
   const [downloads, setDownloads] = useState<DirStats | null>(null);
+  const [thumbs, setThumbs] = useState<DirStats | null>(null);
   const [notice, setNotice] = useState<{ key: string; params?: Params } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [confirmClearThumbs, setConfirmClearThumbs] = useState(false);
 
   const refresh = useCallback(async () => {
     const read = async (kind: string) =>
@@ -166,6 +168,7 @@ export function SettingsPanel({
     try {
       setCache(await read("cache"));
       setDownloads(await read("download"));
+      setThumbs(await read("thumbs"));
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -188,11 +191,13 @@ export function SettingsPanel({
   };
 
   /** The backend decides whether a folder is acceptable, so ask before storing. */
-  const applyPath = async (key: "cachePath" | "downloadPath", value: string | null) => {
+  const PATH_ARGS: Record<string, string> = { cachePath: "cache", downloadPath: "download", thumbPath: "thumbs" };
+
+  const applyPath = async (key: "cachePath" | "downloadPath" | "thumbPath", value: string | null) => {
     setError(null);
     setNotice(null);
     try {
-      await callBackend<string>("set_paths", { [key === "cachePath" ? "cache" : "download"]: value ?? "" });
+      await callBackend<string>("set_paths", { [PATH_ARGS[key]]: value ?? "" });
       onPatch({ [key]: value } as Partial<Settings>);
       setNotice({ key: value ? "set.pathChanged" : "set.pathReset" });
       await refresh();
@@ -202,7 +207,7 @@ export function SettingsPanel({
     }
   };
 
-  const chooseFolder = async (key: "cachePath" | "downloadPath", title: string, current: string | null) => {
+  const chooseFolder = async (key: "cachePath" | "downloadPath" | "thumbPath", title: string, current: string | null) => {
     const chosen = await pickFolder(title, current);
     if (chosen) await applyPath(key, chosen);
   };
@@ -331,6 +336,62 @@ export function SettingsPanel({
               void callBackend("set_paths", { clearOnExit: next }).catch(() => undefined);
             }}
             label={t("set.exitClear")}
+          />
+        </Row>
+      </Group>
+
+      <Group title={t("set.groupThumbCache")}>
+        <PathRow
+          title={t("set.thumbPath")}
+          note={t("set.thumbPathNote")}
+          path={thumbs?.path ?? null}
+          custom={Boolean(settings.thumbCachePath)}
+          onPick={() => void chooseFolder("thumbPath", t("set.groupThumbCache"), thumbs?.path ?? null)}
+          onReset={() => void applyPath("thumbPath", null)}
+        />
+
+        <Row
+          title={thumbs ? t("set.used", { size: formatBytes(thumbs.bytes), count: thumbs.files }) : t("set.counting")}
+          note={t("set.thumbNote")}
+        >
+          {confirmClearThumbs ? (
+            <div className="flex gap-2 shrink-0">
+              <Small
+                danger
+                onClick={() => {
+                  setConfirmClearThumbs(false);
+                  void act("set.thumbsCleared", () => callBackend<string>("trim_thumb_cache", { limitBytes: 0, all: true }));
+                }}
+              >
+                {t("set.confirmClear")}
+              </Small>
+              <Small onClick={() => setConfirmClearThumbs(false)}>{t("common.cancel")}</Small>
+            </div>
+          ) : (
+            <div className="flex gap-2 shrink-0">
+              <Small onClick={() => void act("set.openedFolder", () => callBackend("reveal_folder", { kind: "thumbs" }))}>
+                {t("set.openFolder")}
+              </Small>
+              <Small onClick={() => setConfirmClearThumbs(true)} disabled={!thumbs || thumbs.files === 0}>
+                {t("set.clearThumbs")}
+              </Small>
+            </div>
+          )}
+        </Row>
+
+        <Row title={t("set.thumbLimit")} note={t("set.thumbLimitNote")}>
+          <Choice
+            value={settings.thumbLimitMb}
+            options={[
+              { value: 128, label: "128 MB" },
+              { value: 512, label: "512 MB" },
+              { value: 2048, label: "2 GB" },
+              { value: 1024 * 1024, label: t("set.limitNone") },
+            ]}
+            onChange={(thumbLimitMb) => {
+              onPatch({ thumbLimitMb });
+              void act("set.trimmed", () => callBackend<string>("trim_thumb_cache", { limitBytes: thumbLimitMb * MB, all: false }));
+            }}
           />
         </Row>
       </Group>

@@ -849,6 +849,7 @@ use tauri::Emitter;
 /// `None` keeps the platform default so nothing breaks before it is configured.
 static CACHE_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 static DOWNLOAD_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+static THUMB_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 static CLEAR_CACHE_ON_EXIT: AtomicBool = AtomicBool::new(false);
 
 fn configured(slot: &Mutex<Option<std::path::PathBuf>>) -> Option<std::path::PathBuf> {
@@ -889,12 +890,23 @@ fn download_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     }
 }
 
+/// Previews live in their own folder so they can be thrown away on their own —
+/// they are re-creatable, unlike a file the user asked to keep.
+fn thumb_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    match configured(&THUMB_PATH) {
+        Some(path) => ensure_dir(path, "thumbs"),
+        None => ensure_dir(default_root(app)?.join("thumbs"), "thumbs"),
+    }
+}
+
 #[derive(serde::Serialize)]
 struct Paths {
     cache: String,
     download: String,
+    thumb: String,
     cache_custom: bool,
     download_custom: bool,
+    thumb_custom: bool,
     clear_on_exit: bool,
 }
 
@@ -902,8 +914,10 @@ fn describe_paths(app: &tauri::AppHandle) -> Result<Paths, String> {
     Ok(Paths {
         cache: cache_dir(app)?.to_string_lossy().into_owned(),
         download: download_dir(app)?.to_string_lossy().into_owned(),
+        thumb: thumb_dir(app)?.to_string_lossy().into_owned(),
         cache_custom: configured(&CACHE_PATH).is_some(),
         download_custom: configured(&DOWNLOAD_PATH).is_some(),
+        thumb_custom: configured(&THUMB_PATH).is_some(),
         clear_on_exit: CLEAR_CACHE_ON_EXIT.load(Ordering::Relaxed),
     })
 }
@@ -949,27 +963,32 @@ fn pick(
     Ok(())
 }
 
-/// Reads or updates the two folders and the exit switch in one round trip; the
+/// Reads or updates the three folders and the exit switch in one round trip; the
 /// UI sends only the fields it is changing and always gets the full state back.
 #[tauri::command(async)]
 fn set_paths(
     app: tauri::AppHandle,
     cache: Option<String>,
     download: Option<String>,
+    thumbs: Option<String>,
     clear_on_exit: Option<bool>,
 ) -> Result<String, String> {
     pick(&CACHE_PATH, cache, "cache", true)?;
     pick(&DOWNLOAD_PATH, download, "download", false)?;
+    // Previews are disposable, so the folder they live in has to be ours alone.
+    pick(&THUMB_PATH, thumbs, "thumbs", true)?;
     if let Some(flag) = clear_on_exit {
         CLEAR_CACHE_ON_EXIT.store(flag, Ordering::Relaxed);
     }
-    serde_json::to_string(&describe_paths(&app)?).map_err(|e| e.to_string())
+    let state = serde_json::to_string(&describe_paths(&app)?).map_err(|e| err_arg("encode_failed", e))?;
+    Ok(state)
 }
 
-/// Which of the two folders a command should act on.
+/// Which of the three folders a command should act on.
 fn dir_for(app: &tauri::AppHandle, kind: &str) -> Result<std::path::PathBuf, String> {
     match kind {
         "download" => download_dir(app),
+        "thumbs" => thumb_dir(app),
         _ => cache_dir(app),
     }
 }
@@ -1039,7 +1058,7 @@ fn cached_entries(app: tauri::AppHandle) -> Result<String, String> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
         out.push(CachedEntry { name: name.to_string(), bytes: len, mtime });
     }
-    serde_json::to_string(&out).map_err(|e| e.to_string())
+    serde_json::to_string(&out).map_err(|e| err_arg("encode_failed", e))
 }
 
 fn epoch_secs(at: std::time::SystemTime) -> i64 {
@@ -1102,6 +1121,64 @@ fn clear_cache(app: &tauri::AppHandle, limit_bytes: i64, all: bool) -> Result<(u
 fn trim_cache(app: tauri::AppHandle, limit_bytes: i64, all: bool) -> Result<String, String> {
     let (removed, freed, bytes) = clear_cache(&app, limit_bytes, all)?;
     Ok(serde_json::json!({ "removed": removed, "freed": freed, "bytes": bytes }).to_string())
+}
+
+// ── Thumbnail cache ─────────────────────────────────────────────────────────
+
+/// A preview is kept as the exact `data:` URL the row renders, so reading it
+/// back needs no decoding or re-encoding. The key is built by the front end from
+/// the phone path plus the file's size and modification time, so a photo that
+/// changed on the phone is a different key — a stale picture can never be shown
+/// as if it were current.
+fn thumb_file(dir: &std::path::Path, key: &str) -> Result<std::path::PathBuf, String> {
+    let safe = !key.is_empty()
+        && key.len() <= 96
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.');
+    if !safe {
+        return Err(err("thumb_key_bad"));
+    }
+    Ok(dir.join(key))
+}
+
+/// The stored text, or empty when there is no entry. `none` is a real answer:
+/// it records that this file has no preview to be had, so the phone is not
+/// asked again on every visit.
+#[tauri::command(async)]
+fn thumb_get(app: tauri::AppHandle, key: String) -> Result<String, String> {
+    let path = thumb_file(&thumb_dir(&app)?, &key)?;
+    Ok(std::fs::read_to_string(&path).unwrap_or_default())
+}
+
+#[tauri::command(async)]
+fn thumb_put(app: tauri::AppHandle, key: String, value: String) -> Result<(), String> {
+    let path = thumb_file(&thumb_dir(&app)?, &key)?;
+    std::fs::write(&path, value.as_bytes()).map_err(|e| err_arg("thumb_write_failed", e))
+}
+
+/// Drops the oldest previews until the folder fits, or empties it with `all`.
+#[tauri::command(async)]
+fn trim_thumb_cache(app: tauri::AppHandle, limit_bytes: i64, all: bool) -> Result<String, String> {
+    let mut ours = dir_entries(&thumb_dir(&app)?);
+    ours.sort_by_key(|(_, _, mtime)| *mtime);
+
+    let mut total: u64 = ours.iter().map(|(_, len, _)| *len).sum();
+    let limit = limit_bytes.max(0) as u64;
+    let mut removed = 0u64;
+    let mut freed = 0u64;
+
+    for (path, len, _) in ours {
+        if !all && total <= limit {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
+            removed += 1;
+            freed += len;
+        }
+    }
+    Ok(serde_json::json!({ "removed": removed, "freed": freed, "bytes": total }).to_string())
 }
 
 /// Free bytes on the volume holding one of our folders. Checked before a pull
@@ -1358,10 +1435,96 @@ fn wireless_auto_connect(app: tauri::AppHandle) -> Result<String, String> {
 // ── Tauri entry point ───────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+// ── Window geometry ─────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize, serde::Serialize, Default, Clone, Copy)]
+struct Geometry {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    maximized: bool,
+}
+
+fn geometry_file(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| err_arg("folder_pick", e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| err_arg("folder_pick", e))?;
+    Ok(dir.join("window.json"))
+}
+
+/// Brings back the last size and place — but only where a screen actually is.
+/// A monitor that has been unplugged would otherwise leave the window sitting
+/// somewhere unreachable, which reads to the user as "the app won't open".
+fn restore_geometry(app: &tauri::AppHandle) {
+    let Ok(path) = geometry_file(app) else { return };
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let Ok(saved) = serde_json::from_str::<Geometry>(&text) else { return };
+    if saved.width < 320 || saved.height < 240 {
+        return;
+    }
+
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        // The window described in tauri.conf.json is not necessarily built by
+        // the time the setup hook runs, so wait for it instead of assuming an
+        // order — and take whatever the one window is called.
+        for _ in 0..120 {
+            let window = handle
+                .get_webview_window("main")
+                .or_else(|| handle.webview_windows().into_values().next());
+            let Some(window) = window else {
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            };
+
+            let visible = handle
+                .available_monitors()
+                .unwrap_or_default()
+                .iter()
+                .any(|m| {
+                    let (mx, my) = (m.position().x, m.position().y);
+                    let (mw, mh) = (m.size().width as i32, m.size().height as i32);
+                    saved.x + 80 > mx && saved.x < mx + mw && saved.y + 40 > my && saved.y < my + mh
+                });
+
+            let _ = window.set_size(tauri::PhysicalSize::new(saved.width, saved.height));
+            if visible {
+                let _ = window.set_position(tauri::PhysicalPosition::new(saved.x, saved.y));
+            }
+            if saved.maximized {
+                let _ = window.maximize();
+            }
+            return;
+        }
+    });
+}
+
+fn save_geometry(app: &tauri::AppHandle, label: &str) {
+    // By the time the loop reports Exit the window is already gone, so this has
+    // to run while it still exists — CloseRequested is that moment.
+    let Some(window) = app.get_webview_window(label) else { return };
+    let Ok(position) = window.outer_position() else { return };
+    let Ok(size) = window.outer_size() else { return };
+    let saved = Geometry {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+        maximized: window.is_maximized().unwrap_or(false),
+    };
+    if let (Ok(path), Ok(text)) = (geometry_file(app), serde_json::to_string(&saved)) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            restore_geometry(&app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             check_adb,
             init_daemon,
@@ -1387,6 +1550,9 @@ pub fn run() {
             disk_free,
             cached_entries,
             trim_cache,
+            thumb_get,
+            thumb_put,
+            trim_thumb_cache,
             pull_file,
             cancel_transfer,
             reveal_folder,
@@ -1394,10 +1560,18 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         .run(|app, event| {
-            // Emptying the cache on exit only happens because the settings page
-            // asked for it; downloads are never touched here.
-            if matches!(event, tauri::RunEvent::Exit) && CLEAR_CACHE_ON_EXIT.load(Ordering::Relaxed) {
-                let _ = clear_cache(app, 0, true);
+            match event {
+                tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::CloseRequested { .. }, .. } => {
+                    save_geometry(app, label.as_str());
+                }
+                tauri::RunEvent::Exit => {
+                    // Emptying the cache on exit only happens because the settings
+                    // page asked for it; downloads and previews are never touched.
+                    if CLEAR_CACHE_ON_EXIT.load(Ordering::Relaxed) {
+                        let _ = clear_cache(app, 0, true);
+                    }
+                }
+                _ => {}
             }
         });
 }

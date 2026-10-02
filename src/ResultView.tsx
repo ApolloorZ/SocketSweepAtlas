@@ -184,6 +184,7 @@ export function ResultView({
   flowError,
   onDismissError,
   settings,
+  onPatchSettings,
 }: {
   data: ScanResponse;
   capacity: Capacity | null;
@@ -196,12 +197,13 @@ export function ResultView({
   flowError: FlowError | null;
   onDismissError: () => void;
   settings: Settings;
+  onPatchSettings: (changes: Partial<Settings>) => void;
 }) {
   const { t, lang } = useI18n();
   const [view, setView] = useState<View>("home");
   const [browsePath, setBrowsePath] = useState(data.tree.path);
   const [category, setCategory] = useState<Category>("video");
-  const [sort, setSort] = useState<Sort>({ key: "size", desc: true });
+  const [sort, setSort] = useState<Sort>({ key: settings.sortKey, desc: settings.sortDesc });
   const [query, setQuery] = useState("");
   const [shown, setShown] = useState(300);
   const [selected, setSelected] = useState<Map<string, FileNode>>(new Map());
@@ -268,18 +270,53 @@ export function ResultView({
     return out;
   }, [data, t]);
 
+  // Which place is being looked at decides which search text belongs in the box.
+  const scopeKey = view === "browse" ? `dir:${browsePath}` : view === "category" ? `cat:${category}` : "home";
+  const searchesRef = useRef(settings.searches);
+  searchesRef.current = settings.searches;
+  const scopeRef = useRef(scopeKey);
+  scopeRef.current = scopeKey;
+  const patchRef = useRef(onPatchSettings);
+  patchRef.current = onPatchSettings;
+  const searchTimer = useRef(0);
+
+  // Sort is remembered for every list; search is remembered per folder, because
+  // a query typed in Camera means nothing in WhatsApp.
+  useEffect(() => {
+    const id = window.setTimeout(() => onPatchSettings({ sortKey: sort.key, sortDesc: sort.desc }), 400);
+    return () => window.clearTimeout(id);
+  }, [sort, onPatchSettings]);
+
+  const applyScope = useCallback((key: string) => {
+    setQuery(searchesRef.current[key] ?? "");
+  }, []);
+
+  const onQueryChange = (value: string) => {
+    setQuery(value);
+    window.clearTimeout(searchTimer.current);
+    searchTimer.current = window.setTimeout(() => {
+      const next = { ...searchesRef.current };
+      if (value) next[scopeRef.current] = value;
+      else delete next[scopeRef.current];
+      // A long session browsing many folders should not grow this forever.
+      const keys = Object.keys(next);
+      if (keys.length > 40) delete next[keys[0]];
+      patchRef.current({ searches: next });
+    }, 400);
+  };
+
   const toggleSort = (key: SortKey) =>
     setSort((prev) => (prev.key === key ? { key, desc: !prev.desc } : { key, desc: true }));
 
   const openFolder = useCallback((path: string) => {
     setBrowsePath(path);
     setView("browse");
-    setQuery("");
-    setSort({ key: "size", desc: true });
+    applyScope(`dir:${path}`);
+    setSort({ key: settings.sortKey, desc: settings.sortDesc });
     // Walking to a destination is how a move picks its target, so the marked
     // files must survive it.
     if (!moving) setSelected(new Map());
-  }, [moving]);
+  }, [moving, applyScope, settings.sortKey, settings.sortDesc]);
 
   const parentPath = useMemo(() => {
     const root = data.tree.path;
@@ -501,7 +538,7 @@ export function ResultView({
       <header className="flex items-center gap-3 px-5 py-3 border-b border-zinc-800/80 shrink-0">
         {view !== "home" && (
           <button
-            onClick={() => { setView("home"); setSelected(new Map()); setQuery(""); }}
+            onClick={() => { setView("home"); setSelected(new Map()); applyScope("home"); }}
             className="px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 cursor-pointer"
           >
             {t("view.backHome")}
@@ -601,7 +638,7 @@ export function ResultView({
         <div className="px-5 py-2.5 border-b border-zinc-800/60 shrink-0 flex items-center gap-3">
           <input
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => onQueryChange(e.target.value)}
             placeholder={t(view === "category" ? "view.searchCategory" : "view.searchFolder")}
             className="w-64 max-w-[40%] shrink-0 bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-1.5 text-sm text-zinc-200 placeholder:text-zinc-600 focus:outline-none focus:border-accent-500/50"
           />
@@ -703,7 +740,7 @@ export function ResultView({
                   return (
                     <button
                       key={key}
-                      onClick={() => { setCategory(key); setView("category"); setSelected(new Map()); setQuery(""); setSort({ key: "size", desc: true }); }}
+                      onClick={() => { setCategory(key); setView("category"); setSelected(new Map()); applyScope(`cat:${key}`); setSort({ key: settings.sortKey, desc: settings.sortDesc }); }}
                       className="glass-card rounded-xl px-4 py-3 text-left hover:border-accent-500/40 transition-colors cursor-pointer group"
                     >
                       <div className="flex items-center justify-between gap-2">
@@ -725,7 +762,7 @@ export function ResultView({
             {/* ③ All files entry */}
             <section>
               <button
-                onClick={() => { setBrowsePath(data.tree.path); setView("browse"); setSelected(new Map()); setQuery(""); }}
+                onClick={() => { setBrowsePath(data.tree.path); setView("browse"); setSelected(new Map()); applyScope(`dir:${data.tree.path}`); }}
                 className="w-full glass-card rounded-xl px-5 py-4 flex items-center gap-4 text-left hover:border-accent-500/40 transition-colors cursor-pointer"
               >
                 <TypeGlyph kind="folder" size={40} />
@@ -746,7 +783,7 @@ export function ResultView({
           <div className="px-5 py-3">
             <div className="grid items-center gap-3 px-3 py-2 border-b border-zinc-800/80 sticky top-0 z-10 bg-surface-0" style={{ gridTemplateColumns: grid }}>
               <span />
-              {headerCell(t("col.name"))}
+              {headerCell(t("col.name"), "name")}
               {headerCell(t("col.size"), "size")}
               {headerCell(t("col.share"))}
               {view === "browse" ? headerCell(t("col.counts")) : headerCell(t("col.mtime"), "mtime")}

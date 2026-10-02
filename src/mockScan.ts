@@ -161,14 +161,18 @@ const MOCK_LOCAL_FILE_BYTES = 90 * 1024 * 1024;
 const mockDirs: Record<string, { files: number; bytes: number; path: string }> = {
   cache: { files: 12, bytes: Math.round(318.4 * 1024 * 1024), path: "F:\\dev\\socketsweep-cache" },
   download: { files: 3, bytes: Math.round(742 * 1024 * 1024), path: "F:\\dev\\mock-folder\\downloads" },
+  thumbs: { files: 0, bytes: 0, path: "F:\\dev\\mock-folder\\thumbs" },
 };
+
+/** The disk preview cache, stood in for by a map so the wiring is testable. */
+const mockThumbs = new Map<string, string>();
 
 export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise<string> {  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
   // `?fail=1` in the dev browser exercises the failure path (error card, retry).
   const failing = new URLSearchParams(window.location.search).get("fail");
   if (failing && cmd === (failing || "init_daemon")) {
     return wait(900).then(() => {
-      throw new Error("USB Debugging not authorised. Check the confirmation dialog on your phone.");
+      throw new Error("E#adb_unauthorized");
     });
   }
   switch (cmd) {
@@ -264,13 +268,17 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
       return wait(200).then(() => {
         const cache = typeof args?.cache === "string" ? args.cache : null;
         const download = typeof args?.download === "string" ? args.download : null;
+        const thumbs = typeof args?.thumbs === "string" ? args.thumbs : null;
         if (cache !== null) mockDirs.cache.path = cache || "F:\\dev\\socketsweep-cache";
         if (download !== null) mockDirs.download.path = download || "F:\\dev\\mock-folder\\downloads";
+        if (thumbs !== null) mockDirs.thumbs.path = thumbs || "F:\\dev\\mock-folder\\thumbs";
         return JSON.stringify({
           cache: mockDirs.cache.path,
           download: mockDirs.download.path,
+          thumb: mockDirs.thumbs.path,
           cacheCustom: Boolean(cache),
           downloadCustom: Boolean(download),
+          thumbCustom: Boolean(thumbs),
           clearOnExit: Boolean(args?.clearOnExit),
         });
       });
@@ -292,6 +300,18 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
           }))
         )
       );
+    }
+    case "thumb_get":
+      return Promise.resolve(mockThumbs.get(String(args?.key ?? "")) ?? "");
+    case "thumb_put":
+      return Promise.resolve((mockThumbs.set(String(args?.key ?? ""), String(args?.value ?? "")), ""));
+    case "trim_thumb_cache": {
+      const all = Boolean(args?.all);
+      const removed = all ? mockThumbs.size : 0;
+      if (all) mockThumbs.clear();
+      mockDirs.thumbs.files = mockThumbs.size;
+      mockDirs.thumbs.bytes = all ? 0 : mockThumbs.size * 24 * 1024;
+      return wait(150).then(() => JSON.stringify({ removed, freed: removed * 24 * 1024, bytes: mockDirs.thumbs.bytes }));
     }
     // `?tight=1` makes the volume look smaller than the batch to exercise the
     // out-of-space dialog.

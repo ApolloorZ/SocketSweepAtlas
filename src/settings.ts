@@ -22,6 +22,18 @@ export interface Settings {
   rowShareColor: string;
   /** Read a preview out of each image file and show it in its row. */
   thumbnails: boolean;
+  /** Where previews are kept between runs. null = the app's own cache folder. */
+  thumbCachePath: string | null;
+  /** Previews are disposable, so this folder can be emptied on its own. */
+  thumbLimitMb: number;
+  /** Which column lists sort by, remembered between runs. */
+  sortKey: "size" | "name" | "mtime";
+  sortDesc: boolean;
+  /**
+   * Last search text per folder or category. A query only means something in
+   * the place it was typed, so it is remembered per place rather than globally.
+   */
+  searches: Record<string, string>;
 }
 
 export const MB = 1024 * 1024;
@@ -37,6 +49,13 @@ export const DEFAULT_SETTINGS: Settings = {
   rowShareBar: true,
   rowShareColor: "#38bdf8",
   thumbnails: true,
+  thumbCachePath: null,
+  // Deliberately small: this folder defaults onto the system drive, and a
+  // preview cache should never be what fills a user's C: up.
+  thumbLimitMb: 128,
+  sortKey: "size",
+  sortDesc: true,
+  searches: {},
 };
 
 const KEY = "ss-settings";
@@ -63,6 +82,7 @@ export function readSettings(): Settings {
     localStorage.removeItem(KEY);
   }
   settings.rowShareColor = hexColor(settings.rowShareColor);
+  if (typeof settings.searches !== "object" || settings.searches === null) settings.searches = {};
   return settings;
 }
 

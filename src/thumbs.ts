@@ -20,9 +20,47 @@ const DECODE_CAP = 2 * 1024 * 1024;
 const MAX_PARALLEL = 2;
 
 const urls = new Map<string, string>();
+/** Paths already known to have no preview, so the phone is not asked again. */
+const missing = new Set<string>();
 const inflight = new Map<string, Promise<string | null>>();
 const slots: (() => void)[] = [];
 let running = 0;
+
+/**
+ * Previews are kept on disk between runs, in their own folder. A stored entry is
+ * keyed by path *and* size and mtime, so a photo edited on the phone cannot be
+ * shown from an old capture.
+ */
+const MB = 1024 * 1024;
+let limitBytes = 128 * MB;
+let writes = 0;
+
+export function setThumbLimit(mb: number): void {
+  limitBytes = Math.max(0, mb) * MB;
+}
+
+function fnv1a(text: string): string {
+  let hash = 0x811c9dc5;
+  for (const byte of new TextEncoder().encode(text)) {
+    hash ^= byte;
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function cacheKey(node: FileNode): string {
+  return `${fnv1a(node.path)}-${node.size}-${node.mtime ?? 0}`;
+}
+
+function store(key: string, value: string): void {
+  callBackend("thumb_put", { key, value }).catch(() => undefined);
+  writes += 1;
+  // Trimming is cheap and the folder is disposable, so it happens as a side
+  // effect of use rather than needing a scheduler of its own.
+  if (writes % 24 === 0) {
+    callBackend("trim_thumb_cache", { limitBytes, all: false }).catch(() => undefined);
+  }
+}
 
 function takeSlot(): Promise<void> {
   if (running < MAX_PARALLEL) {
@@ -205,15 +243,26 @@ export function thumbFor(node: FileNode): Promise<string | null> {
   if (known) return Promise.resolve(known);
   const started = inflight.get(node.path);
   if (started) return started;
+  if (missing.has(node.path)) return Promise.resolve(null);
 
   const job = (async () => {
-    if (isMockMode) {
-      const url = mockThumb(node);
-      if (url) urls.set(node.path, url);
-      return url || null;
-    }
+    const key = cacheKey(node);
     await takeSlot();
     try {
+      // The disk cache answers two questions at once: a stored URL, or `none`
+      // meaning "this file has no preview to be had" — so the phone is not
+      // asked again for it on every visit.
+      const stored = await callBackend<string>("thumb_get", { key }).catch(() => "");
+      if (stored === "none") { missing.add(node.path); return null; }
+      if (stored) { urls.set(node.path, stored); return stored; }
+
+      if (isMockMode) {
+        const drawn = mockThumb(node);
+        if (drawn) { urls.set(node.path, drawn); store(key, drawn); }
+        else missing.add(node.path);
+        return drawn || null;
+      }
+
       const size = node.size;
       let bytes: Uint8Array | null;
       if (size > 0 && size <= WHOLE_FILE_BYTES) {
@@ -226,11 +275,16 @@ export function thumbFor(node: FileNode): Promise<string | null> {
           bytes = base64ToBytes(await callBackend<string>("peek_file", { devicePath: node.path, limit: size }));
         }
       }
-      if (!bytes || bytes.length < 512) return null;
+      if (!bytes || bytes.length < 512) {
+        missing.add(node.path);
+        store(key, "none");
+        return null;
+      }
       // A data: URI, not URL.createObjectURL: the packaged app's CSP allows
       // `img-src 'self' data:` and blocks blob:, which dev mode never shows.
       const url = `data:${sniffMime(bytes, node.name)};base64,${bytesToBase64(bytes)}`;
       urls.set(node.path, url);
+      store(key, url);
       return url;
     } catch {
       // A file we cannot preview is not worth interrupting the list for.

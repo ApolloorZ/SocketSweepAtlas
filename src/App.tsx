@@ -4,6 +4,7 @@ import { EmptyScanScreen, ResultView } from "./ResultView";
 import { DevicePanel } from "./DevicePanel";
 import { SettingsPanel } from "./SettingsPanel";
 import { useSettings } from "./settings";
+import { setThumbLimit } from "./thumbs";
 import { addNode, findNode, removeNode } from "./tree";
 import { formatBytes, formatNumber } from "./format";
 import { I18nContext, say, useI18n, useI18nValue, type Params } from "./i18n";
@@ -486,6 +487,12 @@ function App() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const { settings, patch: patchSettings } = useSettings();
+  // The preview folder is trimmed as a side effect of filling it, and that
+  // happens far from any React tree — so the limit is handed over as a plain
+  // module value rather than being threaded through every call.
+  useEffect(() => {
+    setThumbLimit(settings.thumbLimitMb);
+  }, [settings.thumbLimitMb]);
   const i18n = useI18nValue(settings.lang);
   const [logsOpen, setLogsOpen] = useState(settings.logsOpen);
   const [steps, setSteps] = useState<Step[]>(() => stepsFor("usb"));
@@ -959,6 +966,7 @@ function App() {
               flowError={flowError}
               onDismissError={() => setFlowError(null)}
               settings={settings}
+              onPatchSettings={patchSettings}
             />
           )}
         </div>
