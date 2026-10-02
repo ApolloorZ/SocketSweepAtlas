@@ -229,6 +229,13 @@ fn daemon_command(cmd: &str) -> Result<String, String> {
     let response = String::from_utf8_lossy(&plain).trim().to_string();
     let decoded = started.elapsed();
 
+    // A daemon that dies mid-answer can leave *nothing* behind, and an empty
+    // string is not a reply — treating it as one made the front end trip over
+    // `JSON.parse` while the tunnel looked healthy.
+    if !response.starts_with('{') || !response.ends_with('}') {
+        return Err(err_arg("daemon_short", wire));
+    }
+
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     note_stage(
         wire,
@@ -356,19 +363,38 @@ fn init_daemon(app: tauri::AppHandle, serial: Option<String>) -> Result<String, 
 }
 
 #[tauri::command(async)]
-fn run_scan(path: Option<String>) -> Result<String, String> {
+fn run_scan(app: tauri::AppHandle, path: Option<String>) -> Result<String, String> {
     let effective_root = match path {
         Some(ref p) if !p.is_empty() => p.clone(),
         _ => "/sdcard".to_string(), // daemon default
     };
     let cmd = format!("SCAN {effective_root}");
-    let response = match daemon_command(&cmd) {
-        Ok(answer) => answer,
-        // A wireless tunnel that breaks mid-transfer leaves a truncated answer.
-        // Asking once more beats making him press the button again; a second
-        // failure is a real problem and goes to him as one.
-        Err(e) if e.starts_with("E#inflate_failed") => daemon_command(&cmd)?,
-        Err(e) => return Err(e),
+
+    // One automatic recovery per scan, for the two ways a scan dies without
+    // saying so: the tunnel breaks mid-transfer (the answer comes back short or
+    // corrupt), and the daemon being alive but blind — it answers instantly with
+    // an empty tree when the shell user has lost storage access, which looks
+    // exactly like a phone with nothing on it.
+    let mut attempts = 0;
+    let answer = loop {
+        attempts += 1;
+        match daemon_command(&cmd) {
+            Ok(answer) => {
+                let blind = attempts == 1 && answer_is_blind(&answer) && phone_has_data(&app);
+                if blind && revive_daemon(&app).is_ok() {
+                    println!("[SCAN] empty answer on a phone that has data — restarted the daemon, scanning again");
+                    continue;
+                }
+                break answer;
+            }
+            Err(e) => {
+                if attempts == 1 && tunnel_broke(&e) && revive_daemon(&app).is_ok() {
+                    println!("[SCAN] tunnel failed ({e}) — restarted the daemon, scanning again");
+                    continue;
+                }
+                return Err(e);
+            }
+        }
     };
 
     // Store the scan root so delete_item can guard against it.
@@ -376,7 +402,51 @@ fn run_scan(path: Option<String>) -> Result<String, String> {
         *root = Some(effective_root);
     }
 
-    Ok(response)
+    Ok(answer)
+}
+
+/// A well-formed scan that found nothing at all. Real phones with data on them
+/// never produce this, so it means the daemon could not see the filesystem.
+fn answer_is_blind(answer: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(answer)
+        .map(|v| v["status"] == "ok" && v["total_files"].as_i64() == Some(0))
+        .unwrap_or(false)
+}
+
+/// Whether an error means the tunnel or the daemon died rather than the phone
+/// genuinely refusing the command.
+fn tunnel_broke(error: &str) -> bool {
+    [
+        "E#daemon_connect",
+        "E#daemon_send",
+        "E#daemon_read",
+        "E#daemon_timeout",
+        "E#daemon_short",
+        "E#inflate_failed",
+    ]
+    .iter()
+    .any(|code| error.starts_with(code))
+}
+
+/// Does the volume hold anything? Only used to decide whether an empty scan is
+/// worth retrying, so a failing `df` answers "no" and leaves the first result up.
+fn phone_has_data(app: &tauri::AppHandle) -> bool {
+    get_storage_info(app.clone())
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .and_then(|v| v["used_bytes"].as_i64())
+        .unwrap_or(0)
+        > 512 * 1024 * 1024
+}
+
+/// Bring the daemon back from a dead tunnel or a blind start. This is the full
+/// handshake rather than a bare `adb forward`: it kills the old instance — which
+/// may still be sitting on a half-sent answer — re-applies the storage permission
+/// grant, and re-pings before anything else is allowed to talk to it.
+fn revive_daemon(app: &tauri::AppHandle) -> Result<(), String> {
+    let adb_path = get_bundled_binary(app, "adb")?;
+    let _ = adb_s(&adb_path, &["forward", "--remove", &format!("tcp:{DAEMON_PORT}")]);
+    init_daemon(app.clone(), device_serial()).map(|_| ())
 }
 
 #[tauri::command(async)]
@@ -405,7 +475,7 @@ fn get_storage_info(app: tauri::AppHandle) -> Result<String, String> {
         .skip(1)
         .find(|l| l.contains("/storage") || l.contains("/sdcard"))
         .or_else(|| output.lines().nth(1))
-        .ok_or("Failed to read device storage capacity: empty df output")?;
+        .ok_or_else(|| err("df_empty"))?;
 
     let cols: Vec<&str> = row.split_whitespace().collect();
     if cols.len() < 4 {

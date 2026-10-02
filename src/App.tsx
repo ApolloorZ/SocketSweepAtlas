@@ -48,6 +48,16 @@ function hintsFor(message: string): string[] {
  *  root becomes configurable. */
 const SCAN_ROOT = "/sdcard";
 
+/// A scan answer that will not parse is a broken tunnel, not a browser error —
+/// so it is reported as one of ours and gets worded in the chosen language.
+function parseScan(raw: string): ScanResponse {
+  try {
+    return JSON.parse(raw) as ScanResponse;
+  } catch {
+    throw new Error(`E#scan_truncated#${(raw.length / 1048576).toFixed(1)}`);
+  }
+}
+
 // ── Icons ───────────────────────────────────────────────────────────────────
 
 function IconChevron({ open, className = "" }: { open: boolean; className?: string }) {
@@ -678,7 +688,7 @@ function App() {
       markStep("step.scan", "done");
 
       markStep("step.organise", "active");
-      const parsed: ScanResponse = JSON.parse(raw);
+      const parsed = parseScan(raw);
       const parseMs = Math.round(performance.now() - requestAt) - ipcMs;
       if (parsed.status !== "ok") throw new Error(`E#scan_status#${parsed.status || "?"}`);
       if (stale()) return;
@@ -730,7 +740,7 @@ function App() {
       const raw = await callBackend<string>("run_scan", { path: SCAN_ROOT });
       if (stale()) return;
       setSteps(rescanSteps.map((s, i) => ({ ...s, state: (i === 0 ? "done" : "active") as StepState })));
-      const parsed: ScanResponse = JSON.parse(raw);
+      const parsed = parseScan(raw);
       if (stale()) return;
       setScanData(parsed);
       setPhase("result");
