@@ -3,11 +3,16 @@
 // ============================================================================
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -33,6 +38,10 @@ namespace cfg {
     constexpr int         LISTEN_BACKLOG    = 4;
     constexpr int         MAX_DEPTH         = 64;
     constexpr int         RECV_TIMEOUT_SEC  = 30;
+    // Reading a directory on this phone blocks rather than burns CPU, and several
+    // walks started at once were measured to overlap almost completely (see the
+    // project log). Four is where the gain flattened out, so it is also the cap.
+    constexpr int         SCAN_THREADS      = 4;
 }
 
 // ── Globals ─────────────────────────────────────────────────────────────────
@@ -232,13 +241,19 @@ struct FileNode {
     int64_t                  size   = 0;
     int64_t                  mtime  = 0;   // seconds since epoch; 0 when unknown
     std::vector<FileNode>    children;
+    // Which slot of the walk holds this directory's own entries. Only the walk
+    // needs it, and it is a number rather than a pointer because the entries are
+    // produced by other threads and attached afterwards.
+    uint32_t                 dir_id = UINT32_MAX;
 };
 
+// Counted by whichever thread notices the entry, so the totals are the only
+// thing that has to agree with the single-threaded scanner.
 struct ScanStats {
-    int64_t files      = 0;
-    int64_t dirs       = 0;
-    int64_t total_size = 0;
-    int64_t errors     = 0;
+    std::atomic<int64_t> files{0};
+    std::atomic<int64_t> dirs{0};
+    std::atomic<int64_t> total_size{0};
+    std::atomic<int64_t> errors{0};
 };
 
 // ── JSON helpers ────────────────────────────────────────────────────────────
@@ -306,40 +321,84 @@ static void serialize_node(JsonStream& out, const FileNode& node) {
     out.write("}");
 }
 
-// ── Recursive Scanner ───────────────────────────────────────────────────────
-static FileNode scan(const std::string& path, const std::string& name,
-                     ScanStats& st, int depth)
-{
-    FileNode node;
-    node.name = name;
-    node.path = path;
+// ── Directory Walk ──────────────────────────────────────────────────────────
+// A scan used to be one recursive descent on one thread: 250k files took the
+// phone ~25 seconds of nothing but waiting for readdir and lstat. Those calls
+// block instead of computing, and concurrent walks on this storage were measured
+// to overlap almost perfectly, so directories are handed out to a small pool
+// instead. Each worker finishes one directory and drops its entries in a slot;
+// the tree itself is put together on one thread afterwards, in the same order the
+// single-threaded walk produced, so the answer bytes are unchanged.
+namespace {
 
-    struct stat info{};
-    int stat_res = (depth == 0) ? ::stat(path.c_str(), &info) : ::lstat(path.c_str(), &info);
-    if (stat_res != 0) {
+struct DirJob {
+    uint32_t    id;      // the slot this directory's entries go into
+    int         depth;   // depth of this directory itself
+    std::string path;
+};
+
+struct Walk {
+    std::mutex                m;
+    std::condition_variable   cv;
+    std::deque<DirJob>        ready;
+    size_t                    running = 0;
+    bool                      done    = false;
+    std::deque<std::vector<FileNode>> slots;
+
+    /// Reserve a slot for a directory that was just discovered.
+    uint32_t add_slot() {
+        std::lock_guard<std::mutex> lk(m);
+        slots.emplace_back();
+        return static_cast<uint32_t>(slots.size() - 1);
+    }
+
+    void set_slot(uint32_t id, std::vector<FileNode>&& kids) {
+        std::lock_guard<std::mutex> lk(m);
+        slots[id] = std::move(kids);
+    }
+
+    void push(DirJob job) {
+        {
+            std::lock_guard<std::mutex> lk(m);
+            ready.push_back(std::move(job));
+        }
+        cv.notify_one();
+    }
+
+    /// False once the walk is over. Waiting on the predicate rather than the
+    /// notification alone means a wakeup aimed at a thread that was busy cannot
+    /// strand a directory in `ready`.
+    bool take(DirJob& out) {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [this] { return done || !ready.empty(); });
+        if (done) return false;
+        out = std::move(ready.front());
+        ready.pop_front();
+        ++running;
+        return true;
+    }
+
+    /// A job never waits for another job, so the only way the queue can be empty
+    /// for good is no work running and nothing ready.
+    void finish() {
+        std::lock_guard<std::mutex> lk(m);
+        if (--running == 0 && ready.empty()) {
+            done = true;
+            cv.notify_all();
+        }
+    }
+};
+
+/// Read one directory: stat every entry, queue the subdirectories, put the
+/// finished entry list in the job's slot.
+void walk_dir(Walk& w, const DirJob& job, ScanStats& st) {
+    std::vector<FileNode> kids;
+    DIR* dir = ::opendir(job.path.c_str());
+    if (!dir) {
         ++st.errors;
-        return node;
+        w.set_slot(job.id, std::move(kids));
+        return;
     }
-    node.mtime = static_cast<int64_t>(info.st_mtime);
-
-    if (depth > 0 && S_ISLNK(info.st_mode)) return node;
-
-    if (S_ISREG(info.st_mode)) {
-        node.size = info.st_size;
-        ++st.files;
-        st.total_size += info.st_size;
-        return node;
-    }
-
-    if (!S_ISDIR(info.st_mode)) return node;
-
-    node.is_dir = true;
-    ++st.dirs;
-
-    if (depth >= cfg::MAX_DEPTH) { ++st.errors; return node; }
-
-    DIR* dir = ::opendir(path.c_str());
-    if (!dir) { ++st.errors; return node; }
 
     struct dirent* ent;
     while ((ent = ::readdir(dir)) != nullptr) {
@@ -352,22 +411,131 @@ static FileNode scan(const std::string& path, const std::string& name,
         if (ent->d_type == DT_LNK) continue;
         #endif
 
-        std::string child_path = path + '/' + ent->d_name;
+        FileNode child;
+        child.name = ent->d_name;
+        child.path = job.path;
+        child.path += '/';
+        child.path += ent->d_name;
 
-        FileNode child = scan(child_path, ent->d_name, st, depth + 1);
-        node.size += child.size;
-        node.children.push_back(std::move(child));
+        struct stat info{};
+        if (::lstat(child.path.c_str(), &info) != 0) {
+            ++st.errors;
+            kids.push_back(std::move(child));
+            continue;
+        }
+        child.mtime = static_cast<int64_t>(info.st_mtime);
+
+        // Every entry reached here is a child of some directory, so it is always
+        // deeper than the scan root: a link is recorded as an empty leaf.
+        if (S_ISLNK(info.st_mode)) {
+            kids.push_back(std::move(child));
+            continue;
+        }
+        if (S_ISREG(info.st_mode)) {
+            child.size = info.st_size;
+            ++st.files;
+            st.total_size += info.st_size;
+            kids.push_back(std::move(child));
+            continue;
+        }
+        if (!S_ISDIR(info.st_mode)) {
+            kids.push_back(std::move(child));
+            continue;
+        }
+
+        child.is_dir = true;
+        ++st.dirs;
+        if (job.depth + 1 >= cfg::MAX_DEPTH) {
+            ++st.errors;
+            kids.push_back(std::move(child));
+            continue;
+        }
+
+        DirJob next;
+        next.id    = w.add_slot();
+        next.depth = job.depth + 1;
+        next.path  = child.path;
+        child.dir_id = next.id;
+        kids.push_back(std::move(child));
+        w.push(std::move(next));
     }
     ::closedir(dir);
 
-    const auto sort_t0 = std::chrono::steady_clock::now();
-    std::sort(node.children.begin(), node.children.end(),
-              [](const FileNode& a, const FileNode& b) {
-                  return a.size > b.size;
-              });
-    g_sort_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                     std::chrono::steady_clock::now() - sort_t0).count();
+    w.set_slot(job.id, std::move(kids));
+}
 
+/// Attach a directory's entries, then fold the sizes upward and sort — exactly
+/// the order the recursive walk did it in, which is what keeps ties in the same
+/// place and the bytes of the answer identical.
+void build_node(FileNode& node, Walk& w) {
+    if (!node.is_dir || node.dir_id == UINT32_MAX) return;
+
+    std::vector<FileNode> kids = std::move(w.slots[node.dir_id]);
+    for (FileNode& kid : kids) {
+        build_node(kid, w);
+        node.size += kid.size;
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    std::sort(kids.begin(), kids.end(),
+              [](const FileNode& a, const FileNode& b) { return a.size > b.size; });
+    g_sort_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - t0).count();
+
+    node.children = std::move(kids);
+}
+
+}  // namespace
+
+/// Walk `root` with a pool of directory readers and return the finished tree.
+static FileNode scan(const std::string& root, const std::string& name,
+                     ScanStats& st, int threads)
+{
+    FileNode node;
+    node.name = name;
+    node.path = root;
+
+    struct stat info{};
+    if (::stat(root.c_str(), &info) != 0) {
+        ++st.errors;
+        return node;
+    }
+    node.mtime = static_cast<int64_t>(info.st_mtime);
+
+    // The root is the one path the walk follows through a link, as before.
+    if (S_ISREG(info.st_mode)) {
+        node.size = info.st_size;
+        ++st.files;
+        st.total_size += info.st_size;
+        return node;
+    }
+    if (!S_ISDIR(info.st_mode)) return node;
+
+    node.is_dir = true;
+    ++st.dirs;
+
+    Walk w;
+    node.dir_id = w.add_slot();
+    w.push(DirJob{node.dir_id, 0, root});
+
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<size_t>(threads));
+    for (int i = 1; i < threads; ++i) {
+        pool.emplace_back([&w, &st] {
+            DirJob job;
+            while (w.take(job)) { walk_dir(w, job, st); w.finish(); }
+        });
+    }
+
+    // The thread that asked for the scan reads directories too.
+    {
+        DirJob job;
+        while (w.take(job)) { walk_dir(w, job, st); w.finish(); }
+    }
+
+    for (std::thread& t : pool) t.join();
+
+    build_node(node, w);
     return node;
 }
 
@@ -436,32 +604,36 @@ static void handle_client(int fd) {
         g_send_ns    = 0;
         g_send_bytes = 0;
 
+        int threads = static_cast<int>(std::thread::hardware_concurrency());
+        if (threads < 1) threads = 1;
+        if (threads > cfg::SCAN_THREADS) threads = cfg::SCAN_THREADS;
+
         auto t0 = std::chrono::steady_clock::now();
         ScanStats stats{};
-        FileNode tree = scan(root, root_name, stats, 0);
+        FileNode tree = scan(root, root_name, stats, threads);
         auto t1 = std::chrono::steady_clock::now();
         int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         int64_t traverse_ms = ms - ns_to_ms(g_sort_ns);
         if (traverse_ms < 0) traverse_ms = 0;
 
         std::fprintf(stderr, "[engine] Done: %lld files, %lld dirs, "
-                     "%lld bytes, %lld errors, %lld ms "
+                     "%lld bytes, %lld errors, %lld ms with %d readers "
                      "(traverse %lld ms, sort %lld ms)\n",
-                     (long long)stats.files, (long long)stats.dirs,
-                     (long long)stats.total_size, (long long)stats.errors,
-                     (long long)ms, (long long)traverse_ms,
+                     (long long)stats.files.load(), (long long)stats.dirs.load(),
+                     (long long)stats.total_size.load(), (long long)stats.errors.load(),
+                     (long long)ms, threads, (long long)traverse_ms,
                      (long long)ns_to_ms(g_sort_ns));
 
         out.write("{\"status\":\"ok\",\"scan_time_ms\":");
         out.write(std::to_string(ms));
         out.write(",\"total_files\":");
-        out.write(std::to_string(stats.files));
+        out.write(std::to_string(stats.files.load()));
         out.write(",\"total_dirs\":");
-        out.write(std::to_string(stats.dirs));
+        out.write(std::to_string(stats.dirs.load()));
         out.write(",\"total_size\":");
-        out.write(std::to_string(stats.total_size));
+        out.write(std::to_string(stats.total_size.load()));
         out.write(",\"errors\":");
-        out.write(std::to_string(stats.errors));
+        out.write(std::to_string(stats.errors.load()));
         out.write(",\"tree\":");
         serialize_node(out, tree);
 
