@@ -253,7 +253,6 @@ export const MESSAGES: Record<string, [zh: string, en: string]> = {
   "view.noCapacity": ["读不到手机容量信息,占比按已扫描总量计算", "Phone capacity unavailable; shares are measured against what was scanned"],
   "view.scanned": ["扫描到 {count} 个文件 · {size}", "Scanned {count} {p:file|files} · {size}"],
   "view.up": ["返回上一级", "Up one folder"],
-  "view.atRoot": ["已经在根目录", "This is the root"],
   "view.everyFolder": ["全部目录汇总", "Across every folder"],
   "view.searchFolder": ["搜索当前目录…", "Search this folder…"],
   "view.searchCategory": ["搜索文件名或所在目录…", "Search a name or a folder…"],
@@ -283,6 +282,8 @@ export const MESSAGES: Record<string, [zh: string, en: string]> = {
   "col.share": ["占比", "Share"],
   "col.counts": ["文件/文件夹", "Files / folders"],
   "col.mtime": ["修改时间", "Modified"],
+  "col.version": ["版本", "Version"],
+  "col.versionPending": ["读取中…", "reading…"],
   "col.where": ["所在目录", "Folder"],
 
   "row.cached": ["已缓存", "Cached"],

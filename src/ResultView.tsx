@@ -7,6 +7,7 @@ import { breadcrumbs, clearStatsCache, collectCategories, findNode, subtreeStats
 import { formatBytes, formatDate, formatNumber, percent } from "./format";
 import { TypeGlyph, TypeIcon } from "./icons";
 import { Thumb } from "./Thumb";
+import { ApkVersion } from "./ApkVersion";
 import { DownloadsPanel } from "./DownloadsPanel";
 import { useFileOpener } from "./opener";
 import { say, useI18n, type Params } from "./i18n";
@@ -49,7 +50,7 @@ function SizeBar({ ratio }: { ratio: number }) {
 
 // 28px icon · name · size · share · counts/time · time/location · wide hit area for the checkbox
 const GRID_BROWSE = "28px minmax(0,1fr) 110px 68px 96px 84px 44px";
-const GRID_CATEGORY = "28px minmax(0,1fr) 110px 68px 92px minmax(0,1.2fr) 44px";
+const GRID_CATEGORY = "28px minmax(0,1fr) 110px 68px 92px 92px minmax(0,1.2fr) 44px";
 
 // ── Nothing readable ────────────────────────────────────────────────────────
 
@@ -325,6 +326,14 @@ export function ResultView({
     if (!moving) setSelected(new Map());
   }, [moving, applyScope, settings.sortKey, settings.sortDesc]);
 
+  /// Back to the overview. The header button and the ← on the path row both mean
+  /// this once there is no parent folder left to walk to.
+  const goHome = useCallback(() => {
+    setView("home");
+    setSelected(new Map());
+    applyScope("home");
+  }, [applyScope]);
+
   const parentPath = useMemo(() => {
     const root = data.tree.path;
     if (browsePath === root) return null;
@@ -545,7 +554,7 @@ export function ResultView({
       <header className="flex items-center gap-3 px-5 py-3 border-b border-zinc-800/80 shrink-0">
         {view !== "home" && (
           <button
-            onClick={() => { setView("home"); setSelected(new Map()); applyScope("home"); }}
+            onClick={goHome}
             className="px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-300 hover:bg-zinc-700 cursor-pointer"
           >
             {t("view.backHome")}
@@ -595,11 +604,10 @@ export function ResultView({
         <div className="px-5 py-2 border-b border-zinc-800/60 shrink-0 text-sm font-mono text-zinc-500 flex items-center gap-2 min-w-0">
           <button
             id="btn-up"
-            onClick={() => parentPath && openFolder(parentPath)}
-            disabled={!parentPath}
-            title={parentPath ? t("view.up") : t("view.atRoot")}
-            aria-label={t("view.up")}
-            className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 border border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 disabled:opacity-35 disabled:cursor-not-allowed cursor-pointer"
+            onClick={() => (parentPath ? openFolder(parentPath) : goHome())}
+            title={parentPath ? t("view.up") : t("view.backHome")}
+            aria-label={parentPath ? t("view.up") : t("view.backHome")}
+            className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 border border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800 cursor-pointer"
           >
             <IconBack />
           </button>
@@ -794,7 +802,9 @@ export function ResultView({
               {headerCell(t("col.size"), "size")}
               {headerCell(t("col.share"), "share")}
               {view === "browse" ? headerCell(t("col.counts")) : headerCell(t("col.mtime"), "mtime")}
-              {view === "browse" ? headerCell(t("col.mtime"), "mtime") : headerCell(t("col.where"), "dir")}
+              {view === "browse"
+                ? headerCell(t("col.mtime"), "mtime")
+                : <>{headerCell(t("col.version"))}{headerCell(t("col.where"), "dir")}</>}
               <span />
             </div>
 
@@ -846,11 +856,12 @@ export function ResultView({
                     : <span className="text-xs font-mono text-zinc-500">{formatDate(node.mtime, lang)}</span>}
                   {view === "browse"
                     ? <span className="text-xs font-mono text-zinc-500">{formatDate(node.mtime, lang)}</span>
-                    : (
+                    : <>
+                      <span className="text-xs"><ApkVersion node={node} /></span>
                       <span className="text-xs text-zinc-600 truncate" title={node.path}>
                         {node.path.slice(0, node.path.lastIndexOf("/"))}
                       </span>
-                    )}
+                    </>}
                   <span
                     onPointerDown={(e) => startPaint(node, e)}
                     onClick={(e) => e.stopPropagation()}

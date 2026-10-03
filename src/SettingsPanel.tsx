@@ -254,13 +254,6 @@ export function SettingsPanel({
             </span>
           </label>
         </Row>
-        <Row title={t("set.thumbnails")} note={t("set.thumbnailsNote")}>
-          <Switch
-            on={settings.thumbnails}
-            onToggle={() => onPatch({ thumbnails: !settings.thumbnails })}
-            label={t("set.thumbnails")}
-          />
-        </Row>
       </Group>
 
       <Group title={t("set.groupScan")}>
@@ -341,6 +334,13 @@ export function SettingsPanel({
       </Group>
 
       <Group title={t("set.groupThumbCache")}>
+        <Row title={t("set.thumbnails")} note={t("set.thumbnailsNote")}>
+          <Switch
+            on={settings.thumbnails}
+            onToggle={() => onPatch({ thumbnails: !settings.thumbnails })}
+            label={t("set.thumbnails")}
+          />
+        </Row>
         <PathRow
           title={t("set.thumbPath")}
           note={t("set.thumbPathNote")}

@@ -589,15 +589,25 @@ fn base64(bytes: &[u8]) -> String {
 /// preview inside its own header, so the interface can show a thumbnail without
 /// pulling the whole picture across adb.
 #[tauri::command(async)]
-fn peek_file(app: tauri::AppHandle, device_path: String, limit: u32) -> Result<String, String> {
+fn peek_file(app: tauri::AppHandle, device_path: String, limit: u32, offset: u32) -> Result<String, String> {
     if !device_path.starts_with("/sdcard") {
         return Err(err("peek_outside_sdcard"));
     }
     let adb_path = get_bundled_binary(&app, "adb")?;
     // 2 MB ceiling: enough for the front end to take a whole PNG when it carries
     // no EXIF preview, and far short of pulling a real photo across adb.
-    let blocks = (limit / 1024).clamp(1, 2048);
-    let command = format!("dd if={} bs=1024 count={} 2>/dev/null", shell_quote(&device_path), blocks);
+    //
+    // `offset` makes this a byte-range read, because an APK's index sits at the
+    // *end* of the file. `dd` only seeks in whole blocks, so the read starts at
+    // the block below the wanted byte and the remainder is cut off afterwards.
+    let head = offset % 1024;
+    let skip = offset / 1024;
+    let blocks = ((offset % 1024 + limit + 1023) / 1024).clamp(1, 2048);
+    let command = format!(
+        "dd if={} bs=1024 skip={} count={} 2>/dev/null",
+        shell_quote(&device_path), skip, blocks
+    );
+    let wanted = limit.min(blocks * 1024 - head);
 
     let mut args: Vec<String> = Vec::new();
     if let Some(ref serial) = device_serial() {
@@ -616,7 +626,9 @@ fn peek_file(app: tauri::AppHandle, device_path: String, limit: u32) -> Result<S
     if !output.status.success() && output.stdout.is_empty() {
         return Err(err("peek_failed_empty"));
     }
-    Ok(base64(&output.stdout))
+    let from = (head as usize).min(output.stdout.len());
+    let to = (from + wanted as usize).min(output.stdout.len());
+    Ok(base64(&output.stdout[from..to]))
 }
 
 /// Sizes of the files about to be uploaded. The front end adds them up and
@@ -926,13 +938,26 @@ fn configured(slot: &Mutex<Option<std::path::PathBuf>>) -> Option<std::path::Pat
     slot.lock().ok().and_then(|guard| guard.clone())
 }
 
-/// The unconfigured home for both folders. `SOCKETSWEEP_CACHE_DIR` exists so a
-/// dev build can keep its scratch files off the system drive.
+/// The unconfigured home for all three folders: `data\` next to the installed
+/// exe, so a copy of a phone file lands on the same drive as the program rather
+/// than quietly filling the system drive. That only works where the install
+/// folder is writable — an install under Program Files is not — so the choice is
+/// made by a write probe, not by assumption. `SOCKETSWEEP_CACHE_DIR` lets a dev
+/// build keep its scratch files somewhere else entirely.
 fn default_root(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     if let Ok(custom) = std::env::var("SOCKETSWEEP_CACHE_DIR") {
         if !custom.is_empty() {
             return Ok(std::path::PathBuf::from(custom));
         }
+    }
+    if let Some(next_to_app) = std::env::current_exe().ok().and_then(|exe| {
+        let dir = exe.parent()?.join("data");
+        match std::fs::create_dir_all(&dir) {
+            Ok(()) => Some(dir),
+            Err(_) => None,
+        }
+    }) {
+        return Ok(next_to_app);
     }
     app.path()
         .app_cache_dir()
@@ -946,10 +971,12 @@ fn ensure_dir(path: std::path::PathBuf, label: &str) -> Result<std::path::PathBu
     Ok(path)
 }
 
+/// Each of the three gets its own subfolder: "everything in here is ours" has to
+/// stay true for the cache, which is the one that may be emptied on its own.
 fn cache_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     match configured(&CACHE_PATH) {
         Some(path) => ensure_dir(path, "cache"),
-        None => ensure_dir(default_root(app)?, "cache"),
+        None => ensure_dir(default_root(app)?.join("cache"), "cache"),
     }
 }
 

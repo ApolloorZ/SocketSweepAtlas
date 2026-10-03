@@ -266,13 +266,13 @@ export function thumbFor(node: FileNode): Promise<string | null> {
       const size = node.size;
       let bytes: Uint8Array | null;
       if (size > 0 && size <= WHOLE_FILE_BYTES) {
-        bytes = base64ToBytes(await callBackend<string>("peek_file", { devicePath: node.path, limit: WHOLE_FILE_BYTES }));
+        bytes = base64ToBytes(await callBackend<string>("peek_file", { devicePath: node.path, limit: WHOLE_FILE_BYTES, offset: 0 }));
       } else {
-        bytes = exifThumbnail(base64ToBytes(await callBackend<string>("peek_file", { devicePath: node.path, limit: HEAD_BYTES })));
+        bytes = exifThumbnail(base64ToBytes(await callBackend<string>("peek_file", { devicePath: node.path, limit: HEAD_BYTES, offset: 0 })));
         if (!bytes && size > 0 && size <= DECODE_CAP) {
           // No EXIF preview to dig out — a PNG wearing a .jpg name, say. The
           // only picture left is the file itself, so take it while it is small.
-          bytes = base64ToBytes(await callBackend<string>("peek_file", { devicePath: node.path, limit: size }));
+          bytes = base64ToBytes(await callBackend<string>("peek_file", { devicePath: node.path, limit: size, offset: 0 }));
         }
       }
       if (!bytes || bytes.length < 512) {
