@@ -92,10 +92,11 @@ export async function versionFor(node: FileNode): Promise<string | null> {
     const key = cacheKey(node);
     try {
       const stored = await callBackend<string>("thumb_get", { key });
-      if (stored) {
-        const value = stored === "none" ? null : stored;
-        versions.set(node.path, value);
-        return value;
+      // "none" was written by one interim build as a negative marker; it is not
+      // an answer any more, so it reads as "nothing known" and the phone is asked.
+      if (stored && stored !== "none") {
+        versions.set(node.path, stored);
+        return stored;
       }
     } catch {
       // A missing disk cache is not a reason to refuse; just read the phone.
@@ -111,7 +112,11 @@ export async function versionFor(node: FileNode): Promise<string | null> {
       freeSlot();
     }
     versions.set(node.path, value);
-    callBackend("thumb_put", { key, value: value ?? "none" }).catch(() => undefined);
+    // Only a real answer is worth keeping. A blank cell can mean "this APK
+    // declares no version" or "I could not read it" and the two are not
+    // distinguishable here, so an unread one must not be frozen into the cache
+    // the way a missing preview legitimately is.
+    if (value) callBackend("thumb_put", { key, value }).catch(() => undefined);
     return value;
   })();
 
