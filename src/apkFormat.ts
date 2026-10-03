@@ -98,8 +98,11 @@ export async function findEntryLazy(
   name: string
 ): Promise<ZipEntry | null> {
   for (let window = 256 * 1024; window <= 2 * 1024 * 1024; window *= 2) {
-    const at = Math.max(0, fileSize - window);
-    const found = findEntry(await read(at, Math.min(window, fileSize - at)), at, name);
+    // Start on a block boundary so the read runs to the very last byte: an
+    // unaligned start costs a few hundred bytes off the end, and that is where
+    // the end-of-directory record sits.
+    const at = Math.max(0, Math.floor((fileSize - window) / 1024) * 1024);
+    const found = findEntry(await read(at, fileSize - at), at, name);
     if (found !== "wider") return found;
     if (at === 0) return null; // the whole file was already in the window
   }

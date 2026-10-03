@@ -600,9 +600,14 @@ fn peek_file(app: tauri::AppHandle, device_path: String, limit: u32, offset: u32
     // `offset` makes this a byte-range read, because an APK's index sits at the
     // *end* of the file. `dd` only seeks in whole blocks, so the read starts at
     // the block below the wanted byte and the remainder is cut off afterwards.
+    //
+    // The block budget is one block larger than the byte ceiling for exactly
+    // that reason: without it, a request of a full 2 MB at an unaligned offset
+    // would come back a few hundred bytes short of the end of the file, and a
+    // truncated tail is precisely the part a zip index ends with.
     let head = offset % 1024;
     let skip = offset / 1024;
-    let blocks = ((offset % 1024 + limit + 1023) / 1024).clamp(1, 2048);
+    let blocks = ((head + limit + 1023) / 1024).clamp(1, 2049);
     let command = format!(
         "dd if={} bs=1024 skip={} count={} 2>/dev/null",
         shell_quote(&device_path), skip, blocks
