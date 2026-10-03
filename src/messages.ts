@@ -290,6 +290,7 @@ export const MESSAGES: Record<string, [zh: string, en: string]> = {
   "row.dirHint": ["单击进入该目录", "Click to open this folder"],
   "row.fileHint": ["单击勾选,双击拉到电脑上打开", "Click to tick, double-click to open it on the PC"],
   "row.checkHint": ["选择这一项(按住拖动可连续选择)", "Select this item (hold and drag to keep selecting)"],
+  "row.openFolderHint": ["单击跳到这个目录", "Click to walk to this folder"],
   "row.uncheckHint": ["取消选择(按住拖动可连续取消)", "Deselect (hold and drag to keep deselecting)"],
 
   // ── Selection bar ─────────────────────────────────────────────────────────

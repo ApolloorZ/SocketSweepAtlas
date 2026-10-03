@@ -525,6 +525,22 @@ export function ResultView({
     return `linear-gradient(90deg, color-mix(in srgb, ${settings.rowShareColor} 16%, transparent) ${pct}%, transparent ${pct}%)`;
   };
 
+  /**
+   * A marked row has to look marked from across the room. The tint used to win
+   * this fight because it is set inline, which left the checkbox as the only
+   * sign — so the selection is now painted *over* the tint as its own layer,
+   * with a ring that survives both themes.
+   */
+  const rowPaint = (node: FileNode, checked: boolean) => {
+    const tint = rowTint(node);
+    if (!checked) return { background: tint };
+    const fill = "linear-gradient(color-mix(in oklch, var(--color-accent-500) 32%, transparent), color-mix(in oklch, var(--color-accent-500) 32%, transparent))";
+    return {
+      background: tint ? `${fill}, ${tint}` : fill,
+      boxShadow: "inset 0 0 0 1px color-mix(in oklch, var(--color-accent-500) 65%, transparent)",
+    };
+  };
+
   const runDelete = async () => {
     const paths = [...selected.keys()];
     setConfirming(false);
@@ -817,6 +833,7 @@ export function ResultView({
               const stats = isDir ? subtreeStats(node) : null;
               const checked = selected.has(node.path);
               const cached = !isDir && opener.isCached(node);
+              const folder = node.path.slice(0, node.path.lastIndexOf("/"));
               return (
                 <div
                   key={node.path}
@@ -824,8 +841,8 @@ export function ResultView({
                   onClick={() => (isDir ? openFolder(node.path) : toggleSelected(node))}
                   onDoubleClick={() => !isDir && opener.openFile(node)}
                   title={t(isDir ? "row.dirHint" : "row.fileHint")}
-                  className={`grid items-center gap-3 px-3 py-1.5 rounded-md file-row cursor-pointer ${checked ? "bg-accent-500/10" : ""} ${moving && checked ? "opacity-35" : ""}`}
-                  style={{ gridTemplateColumns: grid, background: rowTint(node) }}
+                  className={`grid items-center gap-3 px-3 py-1.5 rounded-md file-row cursor-pointer ${moving && checked ? "opacity-35" : ""}`}
+                  style={{ gridTemplateColumns: grid, ...rowPaint(node, checked) }}
                 >
                   {settings.thumbnails && !isDir && categoryOf(node.name) === "image" ? (
                     <Thumb node={node} fallback={<TypeIcon node={node} />} />
@@ -858,8 +875,17 @@ export function ResultView({
                     ? <span className="text-xs font-mono text-zinc-500">{formatDate(node.mtime, lang)}</span>
                     : <>
                       <span className="text-xs"><ApkVersion node={node} /></span>
-                      <span className="text-xs text-zinc-600 truncate" title={node.path}>
-                        {node.path.slice(0, node.path.lastIndexOf("/"))}
+                      {/* Clicking the path walks there rather than marking the
+                          file — that is the only thing a folder cell should do. */}
+                      <span
+                        title={t("row.openFolderHint")}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openFolder(folder);
+                        }}
+                        className="text-xs text-zinc-500 truncate hover:text-accent-400 hover:underline cursor-pointer"
+                      >
+                        {folder}
                       </span>
                     </>}
                   <span
