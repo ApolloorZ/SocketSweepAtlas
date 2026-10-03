@@ -14,17 +14,24 @@ import type { Settings } from "./settings";
 
 // ── Sorting ────────────────────────────────────────────────────────────────
 
-type SortKey = "size" | "name" | "mtime";
+type SortKey = "size" | "share" | "name" | "mtime" | "dir";
 interface Sort { key: SortKey; desc: boolean }
+
+/** The folder a node sits in, which is what the 所在目录 column shows and sorts by. */
+const parentOf = (path: string) => path.slice(0, path.lastIndexOf("/"));
 
 function compareNodes(a: FileNode, b: FileNode, sort: Sort, locale: string): number {
   // Directories always lead, mirroring how people scan a folder list.
   if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
   const dir = sort.desc ? -1 : 1;
   switch (sort.key) {
-    case "size": return (a.size - b.size) * dir;
+    // Share is size over one constant denominator, so the two orders coincide —
+    // but the column is clickable and the arrow follows, which is what he asked.
+    case "size":
+    case "share": return (a.size - b.size) * dir;
     case "mtime": return ((a.mtime ?? 0) - (b.mtime ?? 0)) * dir;
-    case "name": return a.name.localeCompare(b.name, locale);
+    case "name": return a.name.localeCompare(b.name, locale) * dir;
+    case "dir": return (parentOf(a.path).localeCompare(parentOf(b.path), locale) || b.size - a.size) * dir;
   }
 }
 
@@ -785,9 +792,9 @@ export function ResultView({
               <span />
               {headerCell(t("col.name"), "name")}
               {headerCell(t("col.size"), "size")}
-              {headerCell(t("col.share"))}
+              {headerCell(t("col.share"), "share")}
               {view === "browse" ? headerCell(t("col.counts")) : headerCell(t("col.mtime"), "mtime")}
-              {view === "browse" ? headerCell(t("col.mtime"), "mtime") : headerCell(t("col.where"))}
+              {view === "browse" ? headerCell(t("col.mtime"), "mtime") : headerCell(t("col.where"), "dir")}
               <span />
             </div>
 

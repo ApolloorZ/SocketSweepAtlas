@@ -27,7 +27,7 @@ export interface Settings {
   /** Previews are disposable, so this folder can be emptied on its own. */
   thumbLimitMb: number;
   /** Which column lists sort by, remembered between runs. */
-  sortKey: "size" | "name" | "mtime";
+  sortKey: "size" | "share" | "name" | "mtime" | "dir";
   sortDesc: boolean;
   /**
    * Last search text per folder or category. A query only means something in
