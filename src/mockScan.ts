@@ -36,11 +36,17 @@ function dir(name: string, path: string, children: FileNode[]): FileNode {
  * does not match its parent makes moves and file deletes silently no-op here and
  * pass in the harness while they are broken on the phone.
  */
-function mediaFiles(parent: string, prefix: string, count: number, min: number, max: number): FileNode[] {
+/**
+ * Every bucket the overview shows is decided by the file's extension, so a harness
+ * that named all of its fake files `.jpg` could never exercise the video, audio,
+ * document, archive or APK paths — including the APK version column. The extension
+ * is therefore part of the fixture, not a decoration.
+ */
+function mediaFiles(parent: string, prefix: string, count: number, min: number, max: number, ext = "jpg"): FileNode[] {
   const out: FileNode[] = [];
   for (let i = 0; i < count; i++) {
     const size = Math.round(min + rnd() * (max - min));
-    const name = `${prefix}_${String(i).padStart(4, "0")}.jpg`;
+    const name = `${prefix}_${String(i).padStart(4, "0")}.${ext}`;
     out.push(file(name, `${parent}/${name}`, size));
   }
   return out.sort((a, b) => b.size - a.size);
@@ -51,7 +57,7 @@ function buildTree(): FileNode {
   const MB = 1024 ** 2;
 
   const camera = dir("Camera", "/sdcard/DCIM/Camera", [
-    ...mediaFiles("/sdcard/DCIM/Camera", "VID", 40, 80 * MB, 1.4 * GB),
+    ...mediaFiles("/sdcard/DCIM/Camera", "VID", 40, 80 * MB, 1.4 * GB, "mp4"),
     ...mediaFiles("/sdcard/DCIM/Camera", "IMG", 900, 1.5 * MB, 9 * MB),
   ]);
   const screenshots = dir("Screenshots", "/sdcard/DCIM/Screenshots", mediaFiles("/sdcard/DCIM/Screenshots", "SCR", 120, 0.4 * MB, 2 * MB));
@@ -59,7 +65,7 @@ function buildTree(): FileNode {
 
   const whatsapp = dir("WhatsApp", "/sdcard/Android/media/com.whatsapp/WhatsApp", [
     dir("Media", "/sdcard/Android/media/com.whatsapp/WhatsApp/Media", [
-      dir("WhatsApp Videos", "/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Videos", mediaFiles("/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Videos", "WV", 60, 5 * MB, 200 * MB)),
+      dir("WhatsApp Videos", "/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Videos", mediaFiles("/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Videos", "WV", 60, 5 * MB, 200 * MB, "mp4")),
       dir("WhatsApp Images", "/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images", mediaFiles("/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Images", "WI", 400, 0.2 * MB, 4 * MB)),
     ]),
   ]);
@@ -86,13 +92,14 @@ function buildTree(): FileNode {
     ]),
   ]);
 
-  const music = dir("Music", "/sdcard/Music", mediaFiles("/sdcard/Music", "MUS", 150, 3 * MB, 15 * MB));
-  const movies = dir("Movies", "/sdcard/Movies", mediaFiles("/sdcard/Movies", "MOV", 25, 200 * MB, 2.2 * GB));
+  const music = dir("Music", "/sdcard/Music", mediaFiles("/sdcard/Music", "MUS", 150, 3 * MB, 15 * MB, "mp3"));
+  const movies = dir("Movies", "/sdcard/Movies", mediaFiles("/sdcard/Movies", "MOV", 25, 200 * MB, 2.2 * GB, "mp4"));
   const download = dir("Download", "/sdcard/Download", [
-    ...mediaFiles("/sdcard/Download", "APK", 30, 20 * MB, 300 * MB),
-    ...mediaFiles("/sdcard/Download", "PDF", 45, 0.2 * MB, 12 * MB),
+    ...mediaFiles("/sdcard/Download", "APK", 30, 20 * MB, 300 * MB, "apk"),
+    ...mediaFiles("/sdcard/Download", "PDF", 45, 0.2 * MB, 12 * MB, "pdf"),
+    ...mediaFiles("/sdcard/Download", "BACKUP", 4, 200 * MB, 2 * GB, "zip"),
   ]);
-  const documents = dir("Documents", "/sdcard/Documents", mediaFiles("/sdcard/Documents", "DOC", 60, 0.05 * MB, 6 * MB));
+  const documents = dir("Documents", "/sdcard/Documents", mediaFiles("/sdcard/Documents", "DOC", 60, 0.05 * MB, 6 * MB, "docx"));
 
   return dir("sdcard", "/sdcard", [dcim, android, whatsapp, games, movies, download, music, documents]);
 }
@@ -159,9 +166,9 @@ const MOCK_LOCAL_FILE_BYTES = 90 * 1024 * 1024;
 // Pretend the PC already holds copies in both folders so the settings page has
 // something to report and clearing it visibly changes the number.
 const mockDirs: Record<string, { files: number; bytes: number; path: string }> = {
-  cache: { files: 12, bytes: Math.round(318.4 * 1024 * 1024), path: "F:\\dev\\socketsweep-cache" },
-  download: { files: 3, bytes: Math.round(742 * 1024 * 1024), path: "F:\\dev\\mock-folder\\downloads" },
-  thumbs: { files: 0, bytes: 0, path: "F:\\dev\\mock-folder\\thumbs" },
+  cache: { files: 12, bytes: Math.round(318.4 * 1024 * 1024), path: "D:\\SocketSweepAtlas\\data\\cache" },
+  download: { files: 3, bytes: Math.round(742 * 1024 * 1024), path: "C:\\Users\\you\\Downloads" },
+  thumbs: { files: 0, bytes: 0, path: "D:\\SocketSweepAtlas\\data\\thumbs" },
 };
 
 /** The disk preview cache, stood in for by a map so the wiring is testable. */
@@ -269,9 +276,9 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
         const cache = typeof args?.cache === "string" ? args.cache : null;
         const download = typeof args?.download === "string" ? args.download : null;
         const thumbs = typeof args?.thumbs === "string" ? args.thumbs : null;
-        if (cache !== null) mockDirs.cache.path = cache || "F:\\dev\\socketsweep-cache";
-        if (download !== null) mockDirs.download.path = download || "F:\\dev\\mock-folder\\downloads";
-        if (thumbs !== null) mockDirs.thumbs.path = thumbs || "F:\\dev\\mock-folder\\thumbs";
+        if (cache !== null) mockDirs.cache.path = cache || "D:\\SocketSweepAtlas\\data\\cache";
+        if (download !== null) mockDirs.download.path = download || "C:\\Users\\you\\Downloads";
+        if (thumbs !== null) mockDirs.thumbs.path = thumbs || "D:\\SocketSweepAtlas\\data\\thumbs";
         return JSON.stringify({
           cache: mockDirs.cache.path,
           download: mockDirs.download.path,
