@@ -160,62 +160,17 @@ jobs:
 
       # Windows ADB is adb.exe and requires companion DLLs.
       # Patch tauri.conf.json to bundle the correct filenames.
-      #
-      # The loader step exists because the executable imports WebView2Loader.dll
-      # by name (objdump shows it in the import table), so an installer without it
-      # dies before the window is ever created. The copy the Rust build links
-      # against is vendored inside the webview2-com-sys crate, so it is taken from
-      # there instead of a second download whose version could drift; byte-for-byte
-      # it is the file the working Windows build ships with.
-      - name: Stage WebView2Loader.dll (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          cargo fetch --locked --manifest-path src-tauri/Cargo.toml
-          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
-          $version = (Select-String -Path src-tauri/Cargo.lock -Pattern '^name = "webview2-com-sys"' -Context 0,1).Context.PostContext[0]
-          $version = ($version -replace 'version = "([^"]+)".*', '$1')
-          New-Item -ItemType Directory -Force -Path src-tauri\webview2, src-tauri\webview2\_crate | Out-Null
-          # Prefer the unpacked crate source; fall back to the downloaded .crate
-          # archive, which is where the file still lives when the registry has not
-          # been extracted (cargo unpacks lazily, at build time).
-          $loader = Get-ChildItem -Path (Join-Path $cargoHome 'registry\src') -Recurse -Filter WebView2Loader.dll -ErrorAction SilentlyContinue |
-                    Where-Object { $_.FullName -match '\\webview2-com-sys-[^\\]+\\x64\\' } |
-                    Select-Object -First 1
-          if ($loader) {
-            Copy-Item $loader.FullName src-tauri\webview2\WebView2Loader.dll
-            Write-Host "staged from unpacked crate: $($loader.Directory)"
-          } else {
-            $crate = Get-ChildItem -Path (Join-Path $cargoHome 'registry\cache') -Recurse -Filter "webview2-com-sys-$version.crate" |
-                     Select-Object -First 1
-            if (-not $crate) { Write-Error "neither unpacked source nor $version .crate archive found"; exit 1 }
-            # By absolute path on purpose: whatever `tar` resolves to on PATH may be
-            # GNU tar, which reads the drive letter in F:\... as a remote host and
-            # fails. Windows ships bsdtar in System32, and it takes Windows paths.
-            $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
-            if (-not (Test-Path $tar)) { Write-Error 'no tar.exe in System32'; exit 1 }
-            & $tar -xzf $crate.FullName -C src-tauri\webview2\_crate "webview2-com-sys-$version/x64/WebView2Loader.dll"
-            if ($LASTEXITCODE -ne 0) { Write-Error "tar could not extract the vendored loader"; exit 1 }
-            Copy-Item "src-tauri\webview2\_crate\webview2-com-sys-$version\x64\WebView2Loader.dll" src-tauri\webview2\WebView2Loader.dll
-            Write-Host "staged from the cached $version .crate archive"
-          }
-          Remove-Item -Recurse -Force src-tauri\webview2\_crate -ErrorAction SilentlyContinue
-          $staged = Get-Item src-tauri\webview2\WebView2Loader.dll -ErrorAction SilentlyContinue
-          if (-not $staged -or $staged.Length -lt 100kb) { Write-Error 'staged loader is missing or truncated'; exit 1 }
-          Write-Host ("staged bytes: " + $staged.Length)
-
       - name: Patch Tauri config for Windows ADB
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
-          $conf.bundle.resources = @{
-            'bin/adb.exe'                 = 'bin/adb.exe'
-            'bin/AdbWinApi.dll'           = 'bin/AdbWinApi.dll'
-            'bin/AdbWinUsbApi.dll'        = 'bin/AdbWinUsbApi.dll'
-            'bin/daemon'                  = 'bin/daemon'
-            'webview2/WebView2Loader.dll' = 'WebView2Loader.dll'
-          }
+          $conf.bundle.resources = @(
+            "bin/adb.exe",
+            "bin/AdbWinApi.dll",
+            "bin/AdbWinUsbApi.dll",
+            "bin/daemon"
+          )
           $conf | ConvertTo-Json -Depth 10 | Set-Content src-tauri/tauri.conf.json
           Write-Host "✓ tauri.conf.json patched for Windows"
 
