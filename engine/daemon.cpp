@@ -361,6 +361,9 @@ static FileNode scan(const std::string& path, const std::string& name,
 
     node.is_dir = true;
     ++st.dirs;
+    // Whatever filesystem this directory lives on is now fair game for a delete
+    // anchored to this scan — see safe_delete::Root::allows().
+    g_scan_root.allow_device(info.st_dev);
 
     if (depth >= cfg::MAX_DEPTH) { ++st.errors; return node; }
 
@@ -534,6 +537,10 @@ void walk_dir(Walk& w, const DirJob& job, ScanStats& st) {
 
         child.is_dir = true;
         ++st.dirs;
+        // Record the filesystem this directory lives on, so a delete anchored to
+        // this scan may descend where the scan actually looked (see
+        // safe_delete::Root::allows — /sdcard/Android/data is its own mount).
+        g_scan_root.allow_device(info.st_dev);
         if (job.depth + 1 >= cfg::MAX_DEPTH) {
             ++st.errors;
             kids.push_back(std::move(child));

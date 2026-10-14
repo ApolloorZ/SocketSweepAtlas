@@ -395,6 +395,22 @@ export const MESSAGES: Record<string, [zh: string, en: string]> = {
   "be.daemon_refused": ["手机拒绝了这条命令:{arg}", "The phone refused this command: {arg}"],
   "be.token_failed": ["生成会话密钥失败:{arg}", "The session secret could not be created: {arg}"],
   "be.delete_scan_root": ["不能删除扫描根目录本身。", "The scan root directory itself cannot be deleted."],
+  // The phone's delete rules, worded per rule. Before these existed every refusal
+  // came back as one guessy sentence, which sent people to check their permissions
+  // when the real answer was e.g. "that folder is not on this filesystem".
+  "be.delete_no_scan": ["手机要求先扫描一次才允许删除。请先扫描,再删。", "The phone only deletes inside a folder it has just scanned. Scan again, then delete."],
+  "be.delete_outside_root": ["这个路径不在你扫描的那个目录里面,手机不允许删。", "That path is outside the folder you scanned, so the phone will not delete it."],
+  "be.delete_boundary": ["这个位置在手机上属于另一个文件系统,不是这次扫描走到的地方,所以不会跨过去删除。重新扫描一次通常就能解决。", "That spot sits on a different filesystem than the one this scan walked, so the delete will not cross into it. Scanning again usually fixes it."],
+  "be.delete_changed": ["删除进行中,这个目录被改动过了,为安全起见已经停手。请重新扫描后再试。", "The folder changed underneath the delete, so it stopped rather than guess. Scan again and retry."],
+  "be.delete_symlink": ["这是一个快捷方式(符号链接),程序不会顺着链接去删别的东西。", "That is a symlink, and the app will not follow a link to delete something else."],
+  "be.delete_depth": ["这个目录嵌套太深,超过了安全上限,没有继续往下删。", "That folder nests deeper than the safety limit, so nothing below it was deleted."],
+  "be.delete_readonly": ["手机上的扫描程序处于只读模式(它以 root 身份运行),拒绝一切删除。", "The phone-side scanner is running read-only (it started as root), so it refuses every delete."],
+  "be.delete_permission": ["手机拒绝了这个删除权限。Android 11 以上对 Android/data 这类目录有额外限制。", "The phone refused permission. Android 11 and newer put extra limits on folders like Android/data."],
+  "be.delete_busy": ["这个文件正被手机上的某个程序占用。先在手机上关掉它,或先停止下载/上传任务。", "Something on the phone still holds this file open. Close it on the phone, or stop the transfer that is using it."],
+  "be.delete_missing": ["这个文件在手机上已经不存在了,列表是旧的。请重新扫描。", "That file is already gone from the phone — the list was stale. Scan again."],
+  "be.delete_notempty": ["这个目录里还有没删掉的东西,所以目录本身留下了。", "Something inside that folder could not be deleted, so the folder itself stayed."],
+  "be.delete_is_dir": ["这是一个文件夹,不能按文件删除。", "That is a folder, not a file."],
+  "be.delete_refused": ["手机拒绝了这次删除:{arg}", "The phone refused this delete: {arg}"],
   "be.storage_df": ["读不出手机存储容量:{arg}", "The phone's storage capacity could not be read: {arg}"],
   "be.df_empty": ["手机没有返回容量信息。", "The phone returned no capacity information."],
   "be.encode_failed": ["整理数据时出错:{arg}", "The data could not be assembled: {arg}"],

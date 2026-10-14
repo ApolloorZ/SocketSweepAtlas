@@ -874,16 +874,22 @@ function App() {
     let files = 0;
     let dirs = 0;
     const failed: string[] = [];
+    // The phone refuses a delete for a reason, and the reason is the useful part:
+    // "already gone", "held open", "outside the scanned folder" and "different
+    // filesystem" need four different next moves from the user.
+    const reasons: string[] = [];
 
     for (const path of paths) {
       if (base && path === base.tree.path) {
-        failed.push("err.scanRoot");
+        failed.push(path);
+        reasons.push("E#delete_scan_root");
         continue;
       }
       try {
         const parsed = JSON.parse(await callBackend<string>("delete_item", { path }));
         if (parsed.status !== "ok") {
           failed.push(path);
+          reasons.push("E#delete_refused");
           continue;
         }
         if (tree) {
@@ -896,8 +902,10 @@ function App() {
           }
         }
       } catch (err: unknown) {
+        const code = err instanceof Error ? err.message : String(err);
         failed.push(path);
-        addLog("log.error", { detail: err instanceof Error ? err.message : String(err) });
+        if (code.startsWith("E#")) reasons.push(code);
+        addLog("log.error", { detail: code });
       }
     }
 
@@ -917,10 +925,13 @@ function App() {
     // Gigabytes just went away; the strip has to be asked again.
     if (freed > 0) await refreshCapacity();
     if (failed.length > 0) {
+      // The card's hints go through the same translator as everything else, so an
+      // `E#code` from the bridge is a valid hint — and it beats a guess.
+      const distinct = [...new Set(reasons)];
       setFlowError({
         message: "err.deleteFailed",
-        params: { list: `${failed.slice(0, 3).join(", ")}${failed.length > 3 ? " …" : ""}` },
-        hints: ["hint.deleteInUse"],
+        params: { list: `${failed.slice(0, 3).join(", ")}${failed.length > 3 ? " …" : ""}`, count: failed.length },
+        hints: distinct.length ? distinct.slice(0, 3) : ["hint.deleteInUse"],
       });
     }
     addLog("log.deleteDone", { ok: okCount, failed: failed.length, size: formatBytes(freed) });

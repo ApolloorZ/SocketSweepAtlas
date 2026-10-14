@@ -664,6 +664,46 @@ fn get_storage_info(app: tauri::AppHandle) -> Result<String, String> {
     ))
 }
 
+/// The daemon answers a refused delete the same way it answers a successful one
+/// — a JSON object, delivered over a healthy connection — so the refusal has to
+/// become an error code here. Left as prose, the front end can only guess, and
+/// its guess ("the app may still be using the file") blamed the phone for what
+/// was actually our own mount-boundary rule.
+fn delete_refusal(answer: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(answer).ok()?;
+    if value.get("status").and_then(|s| s.as_str())? != "error" {
+        return None;
+    }
+    let message = value.get("message").and_then(|s| s.as_str()).unwrap_or("");
+    // Prefixes, because the engine appends "; some items were removed…" to a
+    // partial failure, and that tail must not hide which rule refused.
+    const KNOWN: &[(&str, &str)] = &[
+        ("Root scans are read-only", "delete_readonly"),
+        ("No scan performed yet", "delete_no_scan"),
+        ("Delete target must be strictly inside the scan root", "delete_outside_root"),
+        ("Deletion cannot cross a filesystem boundary", "delete_boundary"),
+        ("Delete target is a symlink", "delete_symlink"),
+        ("Deletion depth limit reached", "delete_depth"),
+        ("Directory replaced during deletion", "delete_changed"),
+        ("Directory changed during deletion", "delete_changed"),
+        ("Scan root changed", "delete_changed"),
+        ("Permission denied", "delete_permission"),
+        ("Operation not permitted", "delete_permission"),
+        ("Device or resource busy", "delete_busy"),
+        ("No such file or directory", "delete_missing"),
+        ("Directory not empty", "delete_notempty"),
+        ("Is a directory", "delete_is_dir"),
+    ];
+    Some(
+        match KNOWN.iter().find(|(head, _)| message.starts_with(head)) {
+            Some((_, code)) => err(code),
+            // Anything else really is the phone's own words, and quoting it beats
+            // inventing a translation for an error we did not expect.
+            None => err_arg("delete_refused", message),
+        },
+    )
+}
+
 #[tauri::command(async)]
 fn delete_item(path: String) -> Result<String, String> {
     // Prevent deletion of the scan root directory.
@@ -674,7 +714,11 @@ fn delete_item(path: String) -> Result<String, String> {
             }
         }
     }
-    daemon_command(&format!("DELETE {path}"))
+    let answer = daemon_command(&format!("DELETE {path}"))?;
+    match delete_refusal(&answer) {
+        Some(code) => Err(code),
+        None => Ok(answer),
+    }
 }
 
 /// Quotes nothing and trusts nothing: a file name straight off someone's disk
@@ -1884,6 +1928,43 @@ mod tests {
         assert_eq!(token.len(), 64);
         assert!(token.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
         assert_ne!(token, new_session_token().unwrap());
+    }
+
+    #[test]
+    fn a_refused_delete_becomes_a_code_the_front_end_can_word() {
+        // These strings are the engine's own; if one is renamed there and not
+        // here, the refusal falls through to a quoted English sentence, which is
+        // exactly what the user saw when a mount boundary was mistaken for a
+        // permission problem.
+        assert_eq!(
+            delete_refusal("{\"status\":\"error\",\"message\":\"Deletion cannot cross a filesystem boundary\"}"),
+            Some(err("delete_boundary"))
+        );
+        assert_eq!(
+            delete_refusal("{\"status\":\"error\",\"message\":\"No such file or directory\"}"),
+            Some(err("delete_missing"))
+        );
+        // The engine appends this tail after a partial recursive failure; matching
+        // on a prefix is what keeps the real rule visible.
+        assert_eq!(
+            delete_refusal(
+                "{\"status\":\"error\",\"message\":\"Directory changed during deletion; rescan before deleting; some items were removed. Rescan before trying again\"}"
+            ),
+            Some(err("delete_changed"))
+        );
+        assert_eq!(
+            delete_refusal("{\"status\":\"error\",\"message\":\"Something nobody expected\"}"),
+            Some(err_arg("delete_refused", "Something nobody expected"))
+        );
+    }
+
+    #[test]
+    fn a_successful_delete_is_not_turned_into_an_error() {
+        assert_eq!(
+            delete_refusal("{\"status\":\"ok\",\"message\":\"Deleted 4 items\"}"),
+            None
+        );
+        assert_eq!(delete_refusal("not json at all"), None);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -47,8 +48,23 @@ struct Root {
     Fd fd;
     std::string path;
     struct stat identity{};
+    // Filesystems this scan actually walked into. Android's own layout crosses a
+    // mount boundary at /sdcard/Android/data — a different st_dev over the same
+    // emulated storage — so "only the root's device" would make every app cache
+    // on the phone undeletable, which is most of what needs deleting. A device
+    // joins this set only by being enumerated during the scan the delete is
+    // anchored to, so a mount that appeared afterwards, or one the scan never
+    // entered, is still refused, and every directory along the way keeps its
+    // own dev/inode verification.
+    std::set<dev_t> walked_devices;
 
-    void clear() { fd.reset(); path.clear(); }
+    void clear() { fd.reset(); path.clear(); walked_devices.clear(); }
+
+    void allow_device(dev_t device) { walked_devices.insert(device); }
+
+    bool allows(dev_t device) const {
+        return device == identity.st_dev || walked_devices.count(device) != 0;
+    }
 
     bool open(const std::string& scan_path) {
         clear();
@@ -110,7 +126,7 @@ public:
         struct stat actual{};
         if (::fstat(opened.get(), &actual) != 0) return result.system_error();
         if (!same_entry(expected, actual)) return result.fail("Directory replaced during deletion");
-        if (actual.st_dev != root_.identity.st_dev) return result.fail("Deletion cannot cross a filesystem boundary");
+        if (!root_.allows(actual.st_dev)) return result.fail("Deletion cannot cross a filesystem boundary");
         parents_.push_back({std::move(opened), name, actual});
         SOCKETSWEEP_DELETE_CHECKPOINT("opened", parent(), name.c_str());
         return unchanged(result);
