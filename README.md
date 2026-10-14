@@ -26,19 +26,23 @@
 
 ## 🔧 About this fork
 
-This is a **modified version** of [SocketSweep](https://github.com/VishnuSrivatsava/SocketSweep) by Vishnu Srivatsava, released under the same **GPL-3.0** license — see [LICENSE](LICENSE). It started from upstream `main` at commit `bedcb60` (the v1.1.0 line) and also carries upstream's later fixes; the list below is what *this* fork changed.
+This is a **modified version** of [SocketSweep](https://github.com/VishnuSrivatsava/SocketSweep) by Vishnu Srivatsava, released under the same **GPL-3.0** license — see [LICENSE](LICENSE). It started from upstream `main` at commit `bedcb60` (the v1.1.0 line). Upstream work from `515422c` through `ff8b789` has since been merged into it — the authenticated daemon session, the anchored `safe_delete`, read-only scanning as root, the byte-formatting fix and the CI workflow — and where upstream's version measured worse on this phone, the fork's own version stayed; both are described below and marked in the source.
 
 The goal was to make it something you leave open while clearing a phone, not a demo you run once:
 
 - **The whole interface in Chinese or English**, switchable in Settings and remembered on the machine — *including every backend failure*, which now travels to the front end as an error code and is worded there, so an English user never sees Chinese system text or the reverse.
-- **A file list built for daily use**: four-column table, sortable, searchable, select-all, drag-to-paint selection that scrolls itself when you reach the edge, breadcrumbs, a per-row share tint (colour and on/off in Settings), and image previews dug out of each photo's own EXIF thumbnail.
+- **A file list built for daily use**: four-column table with every header clickable (size, share, name, modified, and the folder a file lives in), searchable, select-all, drag-to-paint selection that scrolls itself when you reach the edge, breadcrumbs that remember where you had scrolled, a per-row share tint (colour and on/off in Settings), and image previews dug out of each photo's own EXIF thumbnail.
+- **Installers say what version they are.** A dedicated column reads each APK's own `versionName` out of its binary manifest — no install, no unpacking, nothing written to the phone.
 - **Both directions**: upload by button or by dragging files in, move files inside the phone, and stop a running transfer — a stopped transfer leaves no half-written file on either side. Free space is checked on the PC *and* on the phone before any byte moves.
 - **Wireless first**: QR pairing, a three-step fallback when the LAN search finds nothing, and one row per phone even when it is plugged in *and* paired over Wi-Fi.
-- **Roughly three times faster over wireless adb.** The phone gzips its own answer (57 MB of repeated paths becomes 9 MB) and the Rust bridge stopped copying the payload three times. Measured on a Redmi K40, 250,000 files: **~74 s → 21–35 s**.
-- **Failures are visible now.** A tunnel that drops mid-scan is reported instead of silently arriving short; commands that talk to the phone run off the UI thread; nothing opens a console window per adb call any more.
+- **Roughly three times faster over wireless adb, then roughly ten again on the phone.** The phone gzips its own answer (57 MB of repeated paths becomes 9 MB) and the Rust bridge stopped copying the payload three times; then directories went to a small pool of readers, because `readdir` and `lstat` block rather than compute. Measured on a Redmi K40 with ~258,000 files: **~74 s → 21–35 s → 6–10 s**, with the phone's own traversal falling from ~33 s to 3–5 s.
+- **The parallel walk is the fork's own, deliberately.** Upstream's `parallel_scan` re-opens every queued directory from the pinned root, one `O_NOFOLLOW` component at a time, which is the stronger guarantee but measured about four times slower here (13–18 s against 3–5 s, three interleaved rounds, same phone, same data) while producing a byte-identical tree. The anchor-and-verify protection is kept where it actually matters — the delete path, `engine/safe_delete.h` — and `tests/test_parallel_scan.py` proves one reader and four answer the same.
+- **Failures are visible now.** A tunnel that drops mid-scan, an answer that arrives with nothing in it, and a daemon that starts but reads zero files are each detected, reported, and recovered by restarting the daemon and rescanning once; commands that talk to the phone run off the UI thread; nothing opens a console window per adb call any more.
+- **Scratch lives where you put the app.** Previews and opened-file caches default to folders under the installation directory instead of the C: drive, are sized, listed, and cleared separately, and downloads are never auto-cleaned.
+- **The phone link is authenticated, and deletion is anchored.** Every connection opens with a random one-shot 32-byte secret that the daemon reads from a `0600` file and unlinks before serving anything, so a command that arrives without it — or with the wrong one — is refused before it is parsed. Deletes are resolved one `openat` component at a time from the directory the last successful scan pinned, with `O_NOFOLLOW` and an identity check at each level, so a path swapped mid-operation cannot be followed, and the scan root itself is never deletable. If the phone's shell happens to run as root, the daemon forces itself read-only and refuses every delete.
 - The log panel prints the phone's own phase breakdown — traverse, sort, write, send, compressed size — so a slow scan says where the time actually went.
 
-Deleting still asks first, and the cache of files you opened lives on the PC, separate from anything on the phone.
+Deleting still asks first, the scan root itself can never be deleted, and every connection to the phone now carries a random one-shot session secret: a command that arrives without it is refused before it is parsed.
 
 ---
 
@@ -243,6 +247,18 @@ Three things differ from the steps above when building this fork:
    npm run tauri build -- --bundles nsis --config src-tauri/tauri.windows-gnu.json
    ```
    `src-tauri/Cargo.toml` also pins `crate-type = ["rlib"]`: the mobile `cdylib`/`staticlib` targets make the Windows GNU linker emit an export table it cannot handle (*export ordinal too large*). An MSVC build does not need this.
+
+### Tests
+
+Three layers, and they run in three different places — CI runs all of them:
+
+| Command | What it covers | Where it runs |
+|---|---|---|
+| `npm test` | `formatBytes`, including the signed, fractional and non-finite cases | anywhere |
+| `cargo test --lib --manifest-path src-tauri/Cargo.toml` | the Rust side of the wire: the `AUTH <secret>` framing, what a command may not contain, the session secret's shape, and that `DAEMON_PROTOCOL` still equals the number `engine/daemon.cpp` announces | anywhere with a working Rust build |
+| `python3 -m unittest discover -s tests -v` | the daemon itself: it compiles `engine/daemon.cpp` and runs it against disposable files — the secret handshake, scan-root protection, delete races, hard-link dedup, and one-reader-versus-four equivalence | Linux and macOS only |
+
+The Python layer needs POSIX semantics the daemon itself uses (`openat`, `O_NOFOLLOW`, `/dev/fd`, symlinks, `RLIMIT_NOFILE`), so it is skipped on Windows by design; `tests/test_root_scan.py` additionally needs root and is run separately in CI inside a throwaway chroot. If you change the walker, run the whole suite *and* re-do the byte-for-byte comparison against the serial scan that `tests/test_parallel_scan.py` starts — the totals agreeing is not enough.
 
 ---
 
