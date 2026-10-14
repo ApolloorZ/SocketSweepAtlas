@@ -65,6 +65,10 @@ Why loopback is not enough on its own: `adb forward` exposes the port to any pro
 - No scan, no delete. A failed scan clears the previous root. The root itself and anything outside it are refused.
 - If the shell is uid 0 the daemon forces `read_only` — no deletes at all, and the serial walk with whole-volume inode dedup and virtual-filesystem exclusions.
 
+Upstream also refused to cross a filesystem boundary, checking each directory against the *root's* `st_dev`. That is the rule that made the app useless on a real phone: `/sdcard/Android/data` is its own mount (`stat -c %D` returns `d2` there while `/sdcard` is `d3`), so every `Android/data/<package>` cache — most of what needs deleting — came back refused. The set of allowed devices is now whatever the scan actually enumerated: `Root` carries a `std::set<dev_t>`, both walkers insert `info.st_dev` for every directory they open, and `descend()` checks membership instead of equality. A mount that appeared after the scan, or one the scan never entered, is still refused, and the per-directory dev/inode verification is unchanged — so the guard is still anchored to a walk the user watched happen.
+
+The other half of the fix is that a refusal has to be *readable*. The daemon answers a refused delete exactly like a successful one — a JSON object over a healthy connection — so the bridge maps the engine's message prefixes to `E#delete_*` codes (15 prefixes → 13 codes: read-only, no scan, outside the root, boundary, symlink, depth, directory changed, permission, busy, missing, not empty, is-a-directory, plus a fallback that quotes the phone's own words) and the wording lives in the dictionary. Prefixes rather than whole sentences, because after a partial recursive failure the engine appends "…; some items were removed" to the truth, and exact matching would hide which rule refused. Before this, the UI guessed "the app may still be using the file", which sent users to check permissions when the honest answer was "that folder is on another filesystem". The scan-root guard is also enforced on the PC side (`E#delete_scan_root`) so that path never leaves the machine.
+
 The fork's addition on the bridge side is that deletes must be *addressable*: paths with newline or NUL never leave the PC at all (`E#cmd_unsafe`).
 
 ## 5. The directory walk — and why it is not upstream's
@@ -182,6 +186,8 @@ Plus two things that live outside the repository because they need the phone: an
 ## 14. Upstream
 
 Merged from upstream: `515422c` (authenticated sessions), `f2248cd` (anchored deletion), `8b177e5` (read-only root scanning), `ff8b789` (bounded parallel walk, exclusions, `skipped`/`scan_threads`/`read_only` fields), `054b7ca` (`formatBytes`), `ed22f3e` (AppImage delta updates), plus the CI workflow they landed in.
+
+`f2248cd` is the one merged change this fork had to widen afterwards: its filesystem-boundary check compared each directory against the *root's* device, and on Android that refuses every `Android/data` folder. The rule, the replacement and why the guard is still anchored are in section 4.
 
 Not merged, with reasons: `parallel_scan.h`'s walk (four times slower here, section 5), `06ed780` (removes the opener plugin — this fork's *reveal in folder* needs it, and the compiler says so the moment it goes), the streaming scan and scan store (section 13), and the front-end UI tests (they assert an interface this fork replaced).
 
