@@ -35,6 +35,9 @@ jobs:
 
       # ── System dependencies (Linux only) ──────────────────────────────────
       # Tauri v2 requires GTK, WebKit, and related libraries on Linux.
+      # zlib1g-dev is for the host-side daemon tests: they compile engine/daemon.cpp
+      # itself, and it gzips its answer with zlib (the root-scan case links -static,
+      # which needs the archive rather than the shared object).
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -45,6 +48,7 @@ jobs:
             librsvg2-dev \
             libxdo-dev \
             libssl-dev \
+            zlib1g-dev \
             patchelf \
             zsync
 

@@ -38,3 +38,7 @@ src-tauri/webview2/WebView2Loader.dll
 # Exclude local JSON test dumps
 out*.json
 
+# The daemon tests are Python; running them leaves bytecode next to the sources.
+__pycache__/
+*.py[cod]
+

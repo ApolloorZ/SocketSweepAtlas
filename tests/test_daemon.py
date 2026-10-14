@@ -1,0 +1,334 @@
+"""Exercise the daemon against disposable files, without an Android device.
+
+Run: python3 -m unittest discover -s tests -v
+
+This is upstream's daemon suite, carried into the fork with three differences,
+each of them a feature this fork added on top of the merged engine:
+
+* The scan answer is gzipped, so the harness decompresses whatever comes back.
+  Compression is best effort in the engine (it falls back to plain text when
+  zlib refuses to start), hence the sniff rather than an unconditional unzip.
+* The engine links zlib, so every compile line here passes `-lz`.
+* File nodes carry `mtime`, which upstream does not emit; `test_mtime...` below
+  pins it so a future merge cannot silently drop it.
+"""
+
+import gzip
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+
+class DaemonHarness(unittest.TestCase):
+    read_only = False
+    scan_threads = None
+    @classmethod
+    def setUpClass(cls):
+        cls.build_dir = tempfile.TemporaryDirectory(prefix="socketsweep-test-build-")
+        cls.binary = str(Path(cls.build_dir.name) / "daemon")
+        compiler = os.environ.get("CXX") or shutil.which("clang++") or "c++"
+        source = Path(__file__).resolve().parents[1] / "engine" / "daemon.cpp"
+        subprocess.run([compiler, "-std=c++17", "-O2", "-pthread", "-Wall", "-Wextra",
+                        "-Wpedantic", "-fno-exceptions", "-fno-rtti",
+                        str(source), "-o", cls.binary, "-lz"], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.build_dir.cleanup()
+
+    def setUp(self):
+        self.files = tempfile.TemporaryDirectory(prefix="socketsweep-test-files-")
+        self.addCleanup(self.files.cleanup)
+        self.root = Path(self.files.name) / "storage"
+        self.root.mkdir()
+        self.token = secrets.token_hex(32)
+        token_file = Path(self.files.name) / "session"
+        token_file.write_text(self.token + "\n")
+        token_file.chmod(0o600)
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            self.port = reservation.getsockname()[1]
+        args = [self.binary, str(self.port), str(token_file)]
+        if self.read_only:
+            args.append("--read-only")
+        if self.scan_threads is not None:
+            args.extend(["--threads", str(self.scan_threads)])
+        self.process = subprocess.Popen(args,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.addCleanup(self.stop)
+        for _ in range(100):
+            try:
+                self.request("PING")
+                break
+            except OSError:
+                if self.process.poll() is not None:
+                    self.fail(self.process.stderr.read().decode())
+                time.sleep(0.01)
+        else:
+            self.fail("Daemon did not start")
+        self.assertFalse(token_file.exists(), "Startup secret must be consumed")
+
+    def stop(self):
+        if self.process.poll() is None:
+            try:
+                self.request("SHUTDOWN")
+                self.process.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                self.process.kill()
+                self.process.wait()
+        self.process.stderr.close()
+
+    def raw_request(self, payload, port=None):
+        with socket.create_connection(("127.0.0.1", port or self.port), timeout=2) as client:
+            client.sendall(payload)
+            client.shutdown(socket.SHUT_WR)
+            data = b""
+            while True:
+                chunk = client.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+                # Plain answers end with a newline; a gzip member ends whenever
+                # it ends. Either way the engine closes the connection once the
+                # answer is out, and the read above returns b"" at that point.
+                if not data.startswith(b"\x1f\x8b") and data.endswith(b"\n"):
+                    break
+        if data.startswith(b"\x1f\x8b"):
+            data = gzip.decompress(data)
+        return json.loads(data)
+
+    def request(self, command, port=None):
+        return self.raw_request(f"AUTH {self.token}\n{command}\n".encode(), port)
+
+    def scan(self):
+        result = self.request(f"SCAN {self.root}")
+        self.assertEqual(result["status"], "ok")
+        return result
+
+
+@unittest.skipIf(os.geteuid() == 0, "Writable daemon tests require an unprivileged user")
+class DaemonTests(DaemonHarness):
+    def test_authenticated_ping_and_scan(self):
+        (self.root / "photo").write_bytes(b"1234567")
+        self.assertEqual(self.request("PING")["protocol_version"], 3)
+        result = self.scan()
+        self.assertEqual(result["total_files"], 1)
+        self.assertEqual(result["total_size"], 7)
+
+    def test_mtime_survives_the_serial_and_parallel_paths(self):
+        (self.root / "new").write_bytes(b"1")
+        os.utime(self.root / "new", (1_700_000_000, 1_700_000_000))
+        nested = self.root / "a" / "b"
+        nested.mkdir(parents=True)
+        (nested / "old").write_bytes(b"22")
+        os.utime(nested / "old", (1_600_000_000, 1_600_000_000))
+        seen = {}
+
+        def walk(node):
+            if node["type"] == "file":
+                seen[node["name"]] = node.get("mtime")
+            for child in node.get("children", []):
+                walk(child)
+
+        # The default thread count makes this the parallel walk; the read-only
+        # class below covers the serial one with the same expectations.
+        walk(self.scan()["tree"])
+        self.assertEqual(seen, {"new": 1_700_000_000, "old": 1_600_000_000})
+
+    def test_commands_require_the_current_secret(self):
+        target = self.root / "keep"
+        target.write_text("keep")
+        self.scan()
+        for command in ["PING", f"SCAN {self.root}", f"DELETE {target}", "SHUTDOWN"]:
+            self.assertEqual(self.raw_request((command + "\n").encode())["status"], "error")
+            wrong = f"AUTH {'0' * 64}\n{command}\n".encode()
+            self.assertEqual(self.raw_request(wrong)["status"], "error")
+        self.assertTrue(target.exists())
+        self.assertEqual(self.request("PING")["status"], "ok")
+
+    def test_delete_preserves_filename_spaces(self):
+        sibling = self.root / "report"
+        sibling.write_text("keep")
+        for name in ["report ", " report", " report "]:
+            target = self.root / name
+            target.write_text("delete")
+            self.scan()
+            self.assertEqual(self.request(f"DELETE {target}")["status"], "ok")
+            self.assertFalse(target.exists())
+            self.assertTrue(sibling.exists())
+
+    def test_invalid_frames_do_not_delete_a_shorter_path(self):
+        target = self.root / "report"
+        target.write_text("keep")
+        self.scan()
+        for suffix in [b"\r\n", b"\0other\n", b"", b"x" * (16 * 1024) + b"\n"]:
+            payload = f"AUTH {self.token}\nDELETE {target}".encode() + suffix
+            self.assertEqual(self.raw_request(payload)["status"], "error")
+            self.assertTrue(target.exists())
+
+    def test_delete_requires_scan_and_rejects_root_and_escapes(self):
+        target = self.root / "keep"
+        target.write_text("keep")
+        self.assertEqual(self.request(f"DELETE {target}")["status"], "error")
+        outside = Path(self.files.name) / "storage-other"
+        outside.mkdir()
+        other = outside / "keep"
+        other.write_text("keep")
+        (self.root / "escape").symlink_to(outside, target_is_directory=True)
+        self.scan()
+        for path in [self.root, outside, other, self.root / ".." / "storage-other" / "keep",
+                     self.root / "escape" / "keep"]:
+            self.assertEqual(self.request(f"DELETE {path}")["status"], "error")
+        self.assertTrue(target.exists())
+        self.assertTrue(other.exists())
+
+    def test_failed_scan_clears_previous_delete_root(self):
+        target = self.root / "keep"
+        target.write_text("keep")
+        self.scan()
+        self.assertEqual(self.request(f"SCAN {self.root / 'missing'}")["status"], "error")
+        self.assertEqual(self.request(f"DELETE {target}")["status"], "error")
+        self.assertTrue(target.exists())
+
+    def test_scan_verb_must_be_exact(self):
+        self.assertEqual(self.request(f"SCANOTHER {self.root}")["status"], "error")
+
+    def test_recursive_delete_never_follows_child_symlinks(self):
+        directory = self.root / "selected"
+        (directory / "nested").mkdir(parents=True)
+        (directory / "nested" / "file").write_text("delete")
+        outside = Path(self.files.name) / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("keep")
+        (directory / "link").symlink_to(outside, target_is_directory=True)
+        self.scan()
+        result = self.request(f"DELETE {directory}")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["message"], "Deleted 4 items")
+        self.assertFalse(directory.exists())
+        self.assertEqual((outside / "keep").read_text(), "keep")
+
+    def test_changed_scan_root_is_rejected(self):
+        (self.root / "keep").write_text("original")
+        self.scan()
+        self.root.rename(Path(self.files.name) / "original-root")
+        self.root.mkdir()
+        (self.root / "keep").write_text("replacement")
+        self.assertEqual(self.request(f"DELETE {self.root / 'keep'}")["status"], "error")
+        self.assertEqual((self.root / "keep").read_text(), "replacement")
+        self.assertEqual((Path(self.files.name) / "original-root" / "keep").read_text(), "original")
+
+    def test_scan_root_alias_is_supported_and_retargeting_rejected(self):
+        (self.root / "remove").write_text("delete")
+        alias = Path(self.files.name) / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        self.assertEqual(self.request(f"SCAN {alias}")["status"], "ok")
+        self.assertEqual(self.request(f"DELETE {alias / 'remove'}")["status"], "ok")
+        outside = Path(self.files.name) / "outside"
+        outside.mkdir()
+        (outside / "keep").write_text("keep")
+        alias.unlink()
+        alias.symlink_to(outside, target_is_directory=True)
+        self.assertEqual(self.request(f"DELETE {alias / 'keep'}")["status"], "error")
+        self.assertTrue((outside / "keep").exists())
+
+
+class ReadOnlyDaemonTests(DaemonHarness):
+    read_only = True
+    scan_threads = 8
+
+    def test_read_only_handshake_and_delete_block_before_and_after_scan(self):
+        status = self.request("PING")
+        self.assertEqual(status["protocol_version"], 3)
+        self.assertEqual(status["uid"], os.geteuid())
+        self.assertTrue(status["read_only"])
+        target = self.root / "keep"
+        target.write_text("private app data")
+        for scanned in [False, True]:
+            if scanned:
+                result = self.scan()
+                self.assertTrue(result["read_only"])
+                self.assertEqual(result["scan_threads"], 1)
+            result = self.request(f"DELETE {target}")
+            self.assertEqual(result["status"], "error")
+            self.assertIn("read-only", result["message"])
+            self.assertEqual(target.read_text(), "private app data")
+
+    def test_mtime_is_emitted_on_the_serial_path_too(self):
+        (self.root / "stamp").write_bytes(b"123")
+        os.utime(self.root / "stamp", (1_650_000_000, 1_650_000_000))
+        children = self.scan()["tree"]["children"]
+        self.assertEqual(children[0]["name"], "stamp")
+        self.assertEqual(children[0]["mtime"], 1_650_000_000)
+
+    def test_hard_links_are_counted_once_and_rescan_resets_seen_entries(self):
+        (self.root / "original").write_bytes(b"1234567")
+        os.link(self.root / "original", self.root / "alias")
+        for _ in range(2):
+            result = self.scan()
+            self.assertEqual(result["total_files"], 1)
+            self.assertEqual(result["total_size"], 7)
+            self.assertEqual(result["skipped"], 1)
+            self.assertEqual(sum(node["size"] for node in result["tree"]["children"]), 7)
+
+    def test_alias_root_is_canonicalized_and_nested_directory_names_are_preserved(self):
+        (self.root / "mnt").mkdir()
+        (self.root / "mnt" / "private-file").write_bytes(b"1234567")
+        alias = Path(self.files.name) / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        result = self.request(f"SCAN {alias}/.")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["tree"]["path"], str(self.root.resolve()))
+        self.assertEqual(result["total_size"], 7)
+        self.assertEqual(result["tree"]["children"][0]["name"], "mnt")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux virtual filesystem types")
+    def test_virtual_filesystem_roots_and_aliases_are_rejected(self):
+        alias = Path(self.files.name) / "proc-alias"
+        alias.symlink_to("/proc", target_is_directory=True)
+        for path in ["/proc", "/sys", str(alias)]:
+            result = self.request(f"SCAN {path}")
+            self.assertEqual(result["status"], "error")
+            self.assertIn("Virtual filesystems", result["message"])
+
+
+class DeletionRaceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.build_dir = tempfile.TemporaryDirectory(prefix="socketsweep-race-build-")
+        cls.binary = str(Path(cls.build_dir.name) / "race-tests")
+        compiler = os.environ.get("CXX") or shutil.which("clang++") or "c++"
+        source = Path(__file__).resolve().parent / "safe_delete_test.cpp"
+        subprocess.run([compiler, "-std=c++17", "-O2", "-pthread", "-Wall", "-Wextra",
+                        "-Wpedantic", "-fno-exceptions", "-fno-rtti",
+                        str(source), "-o", cls.binary], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.build_dir.cleanup()
+
+    def run_case(self, name):
+        result = subprocess.run([self.binary, name], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_parent_symlink_replacement_before_open(self): self.run_case("parent_symlink")
+    def test_parent_replacement_after_open(self): self.run_case("parent_replaced")
+    def test_directory_inode_replacement(self): self.run_case("directory_inode")
+    def test_recursive_child_symlink_replacement(self): self.run_case("recursive_child")
+    def test_leaf_replacement_before_identity_check(self): self.run_case("leaf_replaced")
+    def test_leaf_symlink_replacement_at_unlink(self): self.run_case("leaf_unlink")
+    def test_scan_root_alias_swap_at_unlink(self): self.run_case("root_alias")
+    def test_repeated_calls_release_descriptors(self): self.run_case("descriptors")
+    def test_deep_recursion_stops_safely(self): self.run_case("depth")
+
+
+if __name__ == "__main__":
+    unittest.main()
