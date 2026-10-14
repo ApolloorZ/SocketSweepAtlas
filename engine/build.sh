@@ -52,11 +52,16 @@ fi
 echo "[build] Compiling daemon.cpp → daemon (aarch64-linux-android) ..."
 
 "$CC" \
-    -std=c++17 -O2 -Wall -Wextra -Wpedantic \
+    -std=c++17 -O2 -pthread -Wall -Wextra -Wpedantic \
     -fno-exceptions -fno-rtti -DNDEBUG \
     -static-libstdc++ \
     -s \
     -o "$OUT" "$SRC" "$ZLIB"
 
+# Tauri bundles this copy, rather than engine/daemon. Keep both in sync so
+# local development uses the same protocol and guards as release builds.
+cp "$OUT" "$SCRIPT_DIR/../src-tauri/bin/daemon"
+
 echo "[build] Output: $OUT  ($(wc -c < "$OUT" | tr -d ' ') bytes)"
+echo "[build] Updated src-tauri/bin/daemon"
 echo "[build] Done."

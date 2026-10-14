@@ -3,17 +3,19 @@
 // ============================================================================
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <deque>
-#include <mutex>
+#include <cstdlib>
+#include <cerrno>
 #include <string>
-#include <thread>
 #include <vector>
+#include <set>
+#if defined(__linux__)
+#include <linux/magic.h>
+#include <sys/vfs.h>
+#endif
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -23,12 +25,18 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <filesystem>
-#include <iostream>
-
 // Linked statically from the NDK sysroot, so the binary carries no runtime
 // dependency on a system library that might not be exposed to it.
 #include <zlib.h>
+
+#include "safe_delete.h"
+#include <iostream>
+#include <fstream>
+#include <poll.h>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 // ── Configuration ───────────────────────────────────────────────────────────
 namespace cfg {
@@ -38,55 +46,28 @@ namespace cfg {
     constexpr int         LISTEN_BACKLOG    = 4;
     constexpr int         MAX_DEPTH         = 64;
     constexpr int         RECV_TIMEOUT_SEC  = 30;
-    // Reading a directory on this phone blocks rather than burns CPU, and several
-    // walks started at once were measured to overlap almost completely (see the
-    // project log). Four is where the gain flattened out, so it is also the cap.
-    constexpr int         SCAN_THREADS      = 4;
+    constexpr size_t      MAX_COMMAND_BYTES = 16 * 1024;
+    constexpr int         DEFAULT_SCAN_THREADS = 4;
+    // Reading a directory on this phone blocks rather than burns CPU, and four
+    // readers is where the gain flattened out. The launch flag accepts up to
+    // eight so the number can be probed without recompiling.
+    constexpr int         MAX_SCAN_THREADS = 8;
 }
 
 // ── Globals ─────────────────────────────────────────────────────────────────
 static volatile sig_atomic_t g_running = 1;
 static void on_signal(int) { g_running = 0; }
-static std::string g_scan_root;  // tracks the active scan root for delete validation
+static safe_delete::Root g_scan_root; // pins the successful scan root for deletion
+static std::string g_session_token;
+static bool g_read_only = false;
+static int g_scan_threads = cfg::DEFAULT_SCAN_THREADS;
 
-// Per-phase scan timing, reset at the start of every scan. `send` is measured
-// where bytes are actually handed to the socket, so with compression on it
-// counts the compressed answer — which is the only number the tunnel cares about.
-static int64_t g_sort_ns    = 0;
-static int64_t g_send_ns    = 0;
-static int64_t g_send_bytes = 0;
+// Per-phase scan timing (see SCAN in handle_client). Counters reset per scan.
+static int64_t g_sort_ns    = 0;  // cumulative time sorting directory children
+static int64_t g_send_ns    = 0;  // cumulative time blocked in ::send (socket writes)
+static int64_t g_send_bytes = 0;  // cumulative bytes handed to ::send
 
 static inline int64_t ns_to_ms(int64_t ns) { return ns / 1000000; }
-
-// ── Delete path validation ──────────────────────────────────────────────────
-
-/// Returns true if `target` is strictly inside `root` (component-wise).
-/// Rejects: the root itself, paths that escape via "..", and non-existent paths.
-static bool path_is_safe_to_delete(const std::string& target, const std::string& root) {
-    if (target.empty() || root.empty()) return false;
-
-    // Canonicalize both paths to resolve "..", symlinks, etc.
-    char* real_target = ::realpath(target.c_str(), nullptr);
-    char* real_root   = ::realpath(root.c_str(), nullptr);
-    if (!real_target || !real_root) {
-        free(real_target);
-        free(real_root);
-        return false;
-    }
-
-    std::string rt(real_target);
-    std::string rr(real_root);
-    free(real_target);
-    free(real_root);
-
-    // Target must not be the root itself.
-    if (rt == rr) return false;
-
-    // Target must start with root + "/" (component-wise, not just prefix).
-    // This prevents /sdcard/Down from matching /sdcard/Downloads.
-    if (rr.back() != '/') rr += '/';
-    return rt.size() > rr.size() && rt.compare(0, rr.size(), rr) == 0;
-}
 
 // ── Network & Streaming Helpers ─────────────────────────────────────────────
 class JsonStream {
@@ -214,23 +195,33 @@ public:
     }
 };
 
-static std::string recv_line(int fd) {
-    std::string line;
+static bool recv_line(int fd, std::string& line) {
+    line.clear();
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(cfg::RECV_TIMEOUT_SEC);
     char c;
     while (true) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) return false;
+        struct pollfd event { fd, POLLIN, 0 };
+        int ready = ::poll(&event, 1, static_cast<int>(remaining));
+        if (ready < 0 && errno == EINTR) continue;
+        if (ready <= 0) return false;
         ssize_t n = ::recv(fd, &c, 1, 0);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) break;
-        if (c == '\n') break;
-        if (c != '\r') line += c;
+        if (n <= 0) return false;
+        if (c == '\n') return true;
+        // Never normalize path bytes or execute an incomplete/oversized line.
+        if (c == '\r' || c == '\0' || line.size() >= cfg::MAX_COMMAND_BYTES) return false;
+        line += c;
     }
-    return line;
 }
 
-static std::string trim(std::string s) {
-    while (!s.empty() && s.back()  == ' ') s.pop_back();
-    size_t start = s.find_first_not_of(' ');
-    return (start == std::string::npos) ? "" : s.substr(start);
+static bool valid_token(const std::string& token) {
+    return token.size() == 64 && std::all_of(token.begin(), token.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
 }
 
 // ── Data Model ──────────────────────────────────────────────────────────────
@@ -241,39 +232,25 @@ struct FileNode {
     int64_t                  size   = 0;
     int64_t                  mtime  = 0;   // seconds since epoch; 0 when unknown
     std::vector<FileNode>    children;
-    // Which slot of the walk holds this directory's own entries. Only the walk
-    // needs it, and it is a number rather than a pointer because the entries are
-    // produced by other threads and attached afterwards.
+    // Which slot of the parallel walk holds this directory's own entries. Only
+    // that walk needs it, and it is a number rather than a pointer because the
+    // entries are produced by other threads and attached afterwards.
     uint32_t                 dir_id = UINT32_MAX;
 };
 
-// Counted by whichever thread notices the entry, so the totals are the only
-// thing that has to agree with the single-threaded scanner.
 struct ScanStats {
-    std::atomic<int64_t> files{0};
-    std::atomic<int64_t> dirs{0};
-    std::atomic<int64_t> total_size{0};
-    std::atomic<int64_t> errors{0};
+    int64_t files      = 0;
+    int64_t dirs       = 0;
+    int64_t total_size = 0;
+    int64_t errors     = 0;
+    int64_t skipped    = 0;
+    std::set<std::pair<dev_t, ino_t>> seen;
 };
 
 // ── JSON helpers ────────────────────────────────────────────────────────────
 static void json_escape_into(JsonStream& out, const std::string& s) {
-    // Ordinary bytes go out in whole runs. A 250k-file scan is tens of megabytes
-    // of ordinary bytes, and calling write() once per character dominated the
-    // entire scan on the phone's CPU. Output is byte for byte what the
-    // byte-at-a-time version produced.
-    const unsigned char* data = reinterpret_cast<const unsigned char*>(s.data());
-    const size_t n = s.size();
-    size_t i = 0;
-    while (i < n) {
-        size_t run = i;
-        while (run < n && data[run] >= 0x20 && data[run] != '"' && data[run] != '\\') run++;
-        if (run > i) {
-            out.write(reinterpret_cast<const char*>(data + i), run - i);
-            i = run;
-            continue;
-        }
-        switch (data[i]) {
+    for (unsigned char c : s) {
+        switch (c) {
             case '"':  out.write("\\\"", 2); break;
             case '\\': out.write("\\\\", 2); break;
             case '\b': out.write("\\b", 2); break;
@@ -281,21 +258,17 @@ static void json_escape_into(JsonStream& out, const std::string& s) {
             case '\n': out.write("\\n", 2); break;
             case '\r': out.write("\\r", 2); break;
             case '\t': out.write("\\t", 2); break;
-            default: {
-                char buf[8];
-                int len = std::snprintf(buf, sizeof(buf), "\\u%04x", data[i]);
-                out.write(buf, len);
-            }
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    int len = std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out.write(buf, len);
+                } else {
+                    char b = static_cast<char>(c);
+                    out.write(&b, 1);
+                }
         }
-        i++;
     }
-}
-
-/// Numbers into a stack buffer; `std::to_string` allocated twice per node.
-static void write_number(JsonStream& out, int64_t value) {
-    char buf[24];
-    int len = std::snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value));
-    out.write(buf, static_cast<size_t>(len));
 }
 
 static void serialize_node(JsonStream& out, const FileNode& node) {
@@ -306,9 +279,9 @@ static void serialize_node(JsonStream& out, const FileNode& node) {
     out.write("\",\"type\":");
     out.write(node.is_dir ? "\"directory\"" : "\"file\"");
     out.write(",\"size\":");
-    write_number(out, node.size);
+    out.write(std::to_string(node.size));
     out.write(",\"mtime\":");
-    write_number(out, node.mtime);
+    out.write(std::to_string(node.mtime));
 
     if (node.is_dir) {
         out.write(",\"children\":[");
@@ -321,14 +294,129 @@ static void serialize_node(JsonStream& out, const FileNode& node) {
     out.write("}");
 }
 
-// ── Directory Walk ──────────────────────────────────────────────────────────
-// A scan used to be one recursive descent on one thread: 250k files took the
-// phone ~25 seconds of nothing but waiting for readdir and lstat. Those calls
+// ── Recursive Scanner ───────────────────────────────────────────────────────
+static bool virtual_filesystem(const std::string& path) {
+#if defined(__linux__)
+    struct statfs fs{};
+    if (::statfs(path.c_str(), &fs) != 0) return false; // traversal reports access errors
+    switch (static_cast<unsigned long>(fs.f_type)) {
+        case PROC_SUPER_MAGIC: case SYSFS_MAGIC: case DEVPTS_SUPER_MAGIC:
+        case CGROUP_SUPER_MAGIC: case CGROUP2_SUPER_MAGIC: case DEBUGFS_MAGIC:
+        case TRACEFS_MAGIC: case SECURITYFS_MAGIC: case SELINUX_MAGIC:
+        case BPF_FS_MAGIC: case NSFS_MAGIC:
+            return true;
+        default: return false;
+    }
+#else
+    (void)path;
+    return false;
+#endif
+}
+
+static bool root_mount_alias(const char* name) {
+    // /data/media is the canonical internal media tree. FUSE views can have
+    // different device/inode identities, so inode deduplication alone cannot
+    // prevent them being counted again through /mnt or /storage. APEX images
+    // are already represented by their package files on /system or /data.
+    return std::strcmp(name, "mnt") == 0 || std::strcmp(name, "storage") == 0 ||
+           std::strcmp(name, "data_mirror") == 0 || std::strcmp(name, "apex") == 0 ||
+           std::strcmp(name, "proc") == 0 || std::strcmp(name, "sys") == 0 ||
+           std::strcmp(name, "dev") == 0;
+}
+
+static FileNode scan(const std::string& path, const std::string& name,
+                     ScanStats& st, int depth)
+{
+    FileNode node;
+    node.name = name;
+    node.path = path;
+
+    struct stat info{};
+    int stat_res = (depth == 0) ? ::stat(path.c_str(), &info) : ::lstat(path.c_str(), &info);
+    if (stat_res != 0) {
+        ++st.errors;
+        return node;
+    }
+    node.mtime = static_cast<int64_t>(info.st_mtime);
+
+    if (depth > 0 && S_ISLNK(info.st_mode)) return node;
+    node.is_dir = S_ISDIR(info.st_mode);
+
+    if (g_read_only && (S_ISREG(info.st_mode) || S_ISDIR(info.st_mode))) {
+        if ((S_ISDIR(info.st_mode) && virtual_filesystem(path)) ||
+            !st.seen.emplace(info.st_dev, info.st_ino).second) {
+            ++st.skipped;
+            return node;
+        }
+    }
+
+    if (S_ISREG(info.st_mode)) {
+        node.size = info.st_size;
+        ++st.files;
+        st.total_size += info.st_size;
+        return node;
+    }
+
+    if (!S_ISDIR(info.st_mode)) return node;
+
+    node.is_dir = true;
+    ++st.dirs;
+
+    if (depth >= cfg::MAX_DEPTH) { ++st.errors; return node; }
+
+    DIR* dir = ::opendir(path.c_str());
+    if (!dir) { ++st.errors; return node; }
+
+    struct dirent* ent;
+    while ((ent = ::readdir(dir)) != nullptr) {
+        if (ent->d_name[0] == '.') {
+            if (ent->d_name[1] == '\0') continue;
+            if (ent->d_name[1] == '.' && ent->d_name[2] == '\0') continue;
+        }
+
+        #ifdef DT_LNK
+        if (ent->d_type == DT_LNK) continue;
+        #endif
+
+        if (g_read_only && path == "/" && root_mount_alias(ent->d_name)) {
+            ++st.skipped;
+            continue;
+        }
+        std::string child_path = (path == "/" ? path : path + '/') + ent->d_name;
+
+        FileNode child = scan(child_path, ent->d_name, st, depth + 1);
+        node.size += child.size;
+        node.children.push_back(std::move(child));
+    }
+    ::closedir(dir);
+
+    const auto sort_t0 = std::chrono::steady_clock::now();
+    std::sort(node.children.begin(), node.children.end(),
+              [](const FileNode& a, const FileNode& b) {
+                  return a.size > b.size;
+              });
+    g_sort_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now() - sort_t0).count();
+
+    return node;
+}
+
+// ── Parallel Directory Walk ─────────────────────────────────────────────────
+// The walk above is one recursive descent on one thread: 250k files took this
+// phone ~24 seconds of nothing but waiting for readdir and lstat. Those calls
 // block instead of computing, and concurrent walks on this storage were measured
 // to overlap almost perfectly, so directories are handed out to a small pool
 // instead. Each worker finishes one directory and drops its entries in a slot;
-// the tree itself is put together on one thread afterwards, in the same order the
+// the tree is put together on one thread afterwards, in the same order the
 // single-threaded walk produced, so the answer bytes are unchanged.
+//
+// Upstream solves the same problem with `parallel_scan.h`, which re-opens every
+// queued directory from the pinned scan root one component at a time. That is
+// stronger against a directory being swapped mid-scan, and it costs about four
+// times as long on this phone (13-18 s against 3-4 s, measured over three
+// interleaved rounds on 258k files), so the fork keeps its own walk here. A
+// swap during a scan can only ever report a wrong size; a swap during a
+// *delete* is the dangerous case, and that path is anchored by safe_delete.h.
 namespace {
 
 struct DirJob {
@@ -413,8 +501,9 @@ void walk_dir(Walk& w, const DirJob& job, ScanStats& st) {
 
         FileNode child;
         child.name = ent->d_name;
-        child.path = job.path;
-        child.path += '/';
+        // Same single-slash rule as the recursive walk: a root of "/" must not
+        // produce "//name", or the two walks disagree about the same file.
+        child.path = job.path == "/" ? job.path : job.path + '/';
         child.path += ent->d_name;
 
         struct stat info{};
@@ -488,17 +577,18 @@ void build_node(FileNode& node, Walk& w) {
 }  // namespace
 
 /// Walk `root` with a pool of directory readers and return the finished tree.
-static FileNode scan(const std::string& root, const std::string& name,
-                     ScanStats& st, int threads)
+/// Returns the number of readers that actually ran, which is what the answer
+/// reports as `scan_threads`.
+static int scan_parallel(const std::string& root, const std::string& name,
+                         ScanStats& st, FileNode& node, int requested)
 {
-    FileNode node;
     node.name = name;
     node.path = root;
 
     struct stat info{};
     if (::stat(root.c_str(), &info) != 0) {
         ++st.errors;
-        return node;
+        return 0;
     }
     node.mtime = static_cast<int64_t>(info.st_mtime);
 
@@ -507,12 +597,17 @@ static FileNode scan(const std::string& root, const std::string& name,
         node.size = info.st_size;
         ++st.files;
         st.total_size += info.st_size;
-        return node;
+        return 0;
     }
-    if (!S_ISDIR(info.st_mode)) return node;
+    if (!S_ISDIR(info.st_mode)) return 0;
 
     node.is_dir = true;
     ++st.dirs;
+
+    int threads = requested;
+    if (const unsigned cores = std::thread::hardware_concurrency(); cores > 0 && threads > static_cast<int>(cores))
+        threads = static_cast<int>(cores);
+    if (threads < 1) threads = 1;
 
     Walk w;
     node.dir_id = w.add_slot();
@@ -536,21 +631,33 @@ static FileNode scan(const std::string& root, const std::string& name,
     for (std::thread& t : pool) t.join();
 
     build_node(node, w);
-    return node;
+    return threads;
 }
 
 // ── Command dispatch ────────────────────────────────────────────────────────
 static void handle_client(int fd) {
     struct timeval tv { cfg::RECV_TIMEOUT_SEC, 0 };
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    std::string cmd = trim(recv_line(fd));
-    if (cmd.empty()) return;
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     JsonStream out(fd);
+    std::string auth;
+    if (!recv_line(fd, auth) || auth != "AUTH " + g_session_token) {
+        out.write("{\"status\":\"error\",\"message\":\"Authentication failed\"}\n");
+        return;
+    }
+    std::string cmd;
+    if (!recv_line(fd, cmd) || cmd.empty()) {
+        out.write("{\"status\":\"error\",\"message\":\"Invalid command framing\"}\n");
+        return;
+    }
 
     if (cmd == "PING") {
-        out.write("{\"status\":\"ok\",\"message\":\"pong\"}\n");
+        out.write("{\"status\":\"ok\",\"message\":\"pong\",\"protocol_version\":3,\"uid\":");
+        out.write(std::to_string(::geteuid()));
+        out.write(",\"read_only\":");
+        out.write(g_read_only ? "true" : "false");
+        out.write("}\n");
     }
     else if (cmd == "SHUTDOWN") {
         out.write("{\"status\":\"ok\",\"message\":\"shutting down\"}\n");
@@ -559,34 +666,49 @@ static void handle_client(int fd) {
         return;
     }
     else if (cmd.rfind("DELETE ", 0) == 0) {
-        std::string target = trim(cmd.substr(7));
+        if (g_read_only) {
+            out.write("{\"status\":\"error\",\"message\":\"Root scans are read-only; deletion is disabled\"}\n");
+            return;
+        }
+        std::string target = cmd.substr(7);
 
-        // Server-side delete guard: validate target is strictly inside the scan root.
-        if (g_scan_root.empty()) {
-            out.write("{\"status\":\"error\",\"message\":\"No scan performed yet — cannot validate delete target\"}\n");
-        } else if (!path_is_safe_to_delete(target, g_scan_root)) {
-            out.write("{\"status\":\"error\",\"message\":\"Delete rejected: path is outside scan root or equals scan root\"}\n");
-        } else {
-            std::error_code ec;
-            std::uintmax_t removed = std::filesystem::remove_all(target, ec);
-            if (ec) {
-                out.write("{\"status\":\"error\",\"message\":\"");
-                json_escape_into(out, ec.message());
-                out.write("\"}\n");
-            } else {
-                out.write("{\"status\":\"ok\",\"message\":\"Deleted ");
-                out.write(std::to_string(removed));
-                out.write(" items\"}\n");
+        const auto result = safe_delete::remove(g_scan_root, target, cfg::MAX_DEPTH);
+        if (!result.error.empty()) {
+            out.write("{\"status\":\"error\",\"message\":\"");
+            json_escape_into(out, result.error);
+            if (result.removed > 0) {
+                out.write("; some items were removed. Rescan before trying again");
             }
+            out.write("\"}\n");
+        } else {
+            out.write("{\"status\":\"ok\",\"message\":\"Deleted ");
+            out.write(std::to_string(result.removed));
+            out.write(" items\"}\n");
         }
     }
-    else if (cmd.rfind("SCAN", 0) == 0) {
+    else if (cmd == "SCAN" || cmd.rfind("SCAN ", 0) == 0) {
         std::string root = cfg::DEFAULT_ROOT;
         if (cmd.size() > 4) {
-            std::string arg = trim(cmd.substr(4));
+            std::string arg = cmd.substr(5);
             if (!arg.empty()) root = arg;
         }
         while (root.size() > 1 && root.back() == '/') root.pop_back();
+
+        if (g_read_only) {
+            // Resolve aliases once so /./ or a symlink to / cannot bypass the
+            // whole-device exclusions. Read-only scans never enable deletion.
+            char* canonical = ::realpath(root.c_str(), nullptr);
+            if (!canonical) {
+                out.write("{\"status\":\"error\",\"message\":\"Scan root is not an accessible directory\"}\n");
+                return;
+            }
+            root = canonical;
+            std::free(canonical);
+            if (virtual_filesystem(root)) {
+                out.write("{\"status\":\"error\",\"message\":\"Virtual filesystems are excluded from root scans\"}\n");
+                return;
+            }
+        }
 
         std::string root_name = root;
         auto pos = root.rfind('/');
@@ -594,55 +716,75 @@ static void handle_client(int fd) {
             root_name = root.substr(pos + 1);
 
         std::fprintf(stderr, "[engine] SCAN \"%s\" ...\n", root.c_str());
-        g_scan_root = root;  // store for delete validation
+        g_scan_root.clear();
 
-        // Compress the answer; if zlib refuses to start, send it plain. A slower
-        // scan is acceptable, a broken one is not.
-        if (!out.gzip_start()) std::fprintf(stderr, "[engine] gzip unavailable, sending plain\n");
+        if (!g_scan_root.open(root)) {
+            out.write("{\"status\":\"error\",\"message\":\"Scan root is not an accessible directory\"}\n");
+            return;
+        }
 
         g_sort_ns    = 0;
         g_send_ns    = 0;
         g_send_bytes = 0;
 
-        int threads = static_cast<int>(std::thread::hardware_concurrency());
-        if (threads < 1) threads = 1;
-        if (threads > cfg::SCAN_THREADS) threads = cfg::SCAN_THREADS;
+        // Compress the answer; if zlib refuses to start, send it plain. A slower
+        // scan is acceptable, a broken one is not.
+        if (!out.gzip_start()) std::fprintf(stderr, "[engine] gzip unavailable, sending plain\n");
 
         auto t0 = std::chrono::steady_clock::now();
         ScanStats stats{};
-        FileNode tree = scan(root, root_name, stats, threads);
+        FileNode tree;
+        int scan_threads = 1;
+        if (g_read_only) {
+            // Preserve serial, scan-wide inode deduplication and exclusions.
+            tree = scan(root, root_name, stats, 0);
+        } else {
+            scan_threads = scan_parallel(root, root_name, stats, tree, g_scan_threads);
+        }
+        if (!g_scan_root.unchanged()) {
+            g_scan_root.clear();
+            out.write("{\"status\":\"error\",\"message\":\"Scan root changed during scan; scan again\"}\n");
+            return;
+        }
         auto t1 = std::chrono::steady_clock::now();
         int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
         int64_t traverse_ms = ms - ns_to_ms(g_sort_ns);
         if (traverse_ms < 0) traverse_ms = 0;
 
         std::fprintf(stderr, "[engine] Done: %lld files, %lld dirs, "
-                     "%lld bytes, %lld errors, %lld ms with %d readers "
+                     "%lld bytes, %lld errors, %lld ms "
                      "(traverse %lld ms, sort %lld ms)\n",
-                     (long long)stats.files.load(), (long long)stats.dirs.load(),
-                     (long long)stats.total_size.load(), (long long)stats.errors.load(),
-                     (long long)ms, threads, (long long)traverse_ms,
+                     (long long)stats.files, (long long)stats.dirs,
+                     (long long)stats.total_size, (long long)stats.errors,
+                     (long long)ms, (long long)traverse_ms,
                      (long long)ns_to_ms(g_sort_ns));
 
         out.write("{\"status\":\"ok\",\"scan_time_ms\":");
         out.write(std::to_string(ms));
+        out.write(",\"scan_threads\":");
+        out.write(std::to_string(scan_threads));
         out.write(",\"total_files\":");
-        out.write(std::to_string(stats.files.load()));
+        out.write(std::to_string(stats.files));
         out.write(",\"total_dirs\":");
-        out.write(std::to_string(stats.dirs.load()));
+        out.write(std::to_string(stats.dirs));
         out.write(",\"total_size\":");
-        out.write(std::to_string(stats.total_size.load()));
+        out.write(std::to_string(stats.total_size));
         out.write(",\"errors\":");
-        out.write(std::to_string(stats.errors.load()));
+        out.write(std::to_string(stats.errors));
+        out.write(",\"skipped\":");
+        out.write(std::to_string(stats.skipped));
+        out.write(",\"read_only\":");
+        out.write(g_read_only ? "true" : "false");
         out.write(",\"tree\":");
         serialize_node(out, tree);
 
         // The phase numbers can only be taken once the tree has gone out, and
-        // most of it is still inside the compressor's buffer at this point.
-        // sync() pushes that buffer through deflate *and* asks it to emit what
-        // it is holding back, without closing the gzip member — finish() does
-        // that once the answer is complete — so the counters below cover the
-        // whole payload and the reader still gets one well-formed stream.
+        // with compression on most of it is still inside the compressor's
+        // buffer at this point. sync() pushes that buffer through deflate *and*
+        // asks it to emit what it is holding back, without closing the gzip
+        // member — finish() does that once the answer is complete — so the
+        // counters below cover the whole payload and the reader still gets one
+        // well-formed stream.
         out.sync();
         const auto t2 = std::chrono::steady_clock::now();
         const int64_t serialize_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
@@ -663,7 +805,8 @@ static void handle_client(int fd) {
     else {
         out.write("{\"status\":\"error\",\"message\":\"Unknown command\"}\n");
     }
-    // Closes the gzip member, which is what lets the reader know the answer ends here.
+    // Closes the gzip member, which is what lets the reader know the answer
+    // ends here, and reports a tunnel that broke part way through.
     const bool sent = out.finish();
     if (!sent || !out.ok()) {
         std::fprintf(stderr, "[engine] answer incomplete: the tunnel broke mid-transfer\n");
@@ -676,6 +819,39 @@ int main(int argc, char* argv[]) {
 
     uint16_t port = cfg::PORT;
     if (argc > 1) port = static_cast<uint16_t>(std::atoi(argv[1]));
+
+    // A shell-owned 0600 file supplies the secret, keeping it out of process
+    // arguments. Consume and unlink it before accepting any connections.
+    bool read_only_requested = false;
+    bool threads_requested = false;
+    bool valid_args = argc >= 3;
+    for (int i = 3; valid_args && i < argc; ++i) {
+        if (std::strcmp(argv[i], "--read-only") == 0 && !read_only_requested) {
+            read_only_requested = true;
+        } else if (std::strcmp(argv[i], "--threads") == 0 && !threads_requested && i + 1 < argc) {
+            threads_requested = true;
+            const std::string value = argv[++i];
+            valid_args = value.size() == 1 && value[0] >= '1' &&
+                         value[0] <= '0' + cfg::MAX_SCAN_THREADS;
+            if (valid_args) g_scan_threads = value[0] - '0';
+        } else {
+            valid_args = false;
+        }
+    }
+    if (!valid_args) {
+        std::fprintf(stderr, "[engine] Usage: daemon PORT TOKEN_FILE [--read-only] [--threads 1..8]\n");
+        return 1;
+    }
+    // Even an already-root ADB shell using the default launch cannot delete.
+    g_read_only = read_only_requested || ::geteuid() == 0;
+    {
+        std::ifstream token_file(argv[2]);
+        std::getline(token_file, g_session_token);
+    }
+    if (::unlink(argv[2]) != 0 || !valid_token(g_session_token)) {
+        std::fprintf(stderr, "[engine] Failed to load session token\n");
+        return 1;
+    }
 
     ::signal(SIGINT,  on_signal);
     ::signal(SIGTERM, on_signal);

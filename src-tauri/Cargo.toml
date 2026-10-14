@@ -24,6 +24,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+getrandom = "0.3"
 # The phone gzips its scan answer — 56 MB of repeated paths becomes 9 MB, which is
 # the difference between a 45s transfer and a 6s one over wireless adb.
 flate2 = "1"

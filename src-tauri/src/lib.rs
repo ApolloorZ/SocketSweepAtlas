@@ -6,8 +6,10 @@
 // React frontend can display meaningful error messages.
 //
 // Wire protocol (matches Phase 1 daemon):
-//   → "PING\n"              ← {"status":"ok","message":"pong"}
-//   → "SCAN [path]\n"       ← {"status":"ok","scan_time_ms":…,"tree":{…}}
+// Every connection opens with "AUTH <session token>\n" and then one command.
+//   → "PING\n"              ← {"status":"ok","message":"pong","protocol_version":3,"uid":…}
+//   → "SCAN [path]\n"       ← gzip({"status":"ok","scan_time_ms":…,"scan_threads":…,
+//                                   "skipped":…,"read_only":…,"tree":{…}})
 //   → "SHUTDOWN\n"          ← {"status":"ok","message":"shutting down"}
 // ============================================================================
 
@@ -24,6 +26,14 @@ use std::time::Duration;
 const DAEMON_PORT: u16 = 5050;
 const DAEMON_ADDR: &str = "127.0.0.1:5050";
 const DEVICE_BIN_PATH: &str = "/data/local/tmp/socketsweep_daemon";
+/// Where the one-shot session secret is handed to the daemon. The daemon reads
+/// and unlinks it before it accepts a single connection, so the secret never
+/// appears in the process arguments the phone can list.
+const DEVICE_TOKEN_PATH: &str = "/data/local/tmp/socketsweep_token";
+/// The handshake version the bundled daemon announces. Version 3 is the one
+/// that carries `--read-only`, `--threads` and the `skipped` counter; anything
+/// else means the binary on the phone is not the one shipped with this build.
+const DAEMON_PROTOCOL: u32 = 3;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_READ_TIMEOUT: Duration = Duration::from_secs(120); // scans can be slow
 
@@ -32,6 +42,28 @@ static SCAN_ROOT: Mutex<Option<String>> = Mutex::new(None);
 
 /// Tracks the serial of the connected device so all ADB calls target the right device.
 static DEVICE_SERIAL: Mutex<Option<String>> = Mutex::new(None);
+
+/// The secret the running daemon expects on every connection. No token means no
+/// session: nothing at all can be asked of the phone until one is handed out.
+static SESSION_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+/// Connection changes, scans and deletes must not interleave. The daemon serves
+/// one client at a time, so a restart while another command is in flight would
+/// hand that command a daemon it never spoke to.
+static DAEMON_OPERATION: Mutex<()> = Mutex::new(());
+
+fn session_token() -> Result<String, String> {
+    SESSION_TOKEN
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .ok_or_else(|| err("no_session"))
+}
+
+fn set_session_token(token: Option<String>) -> Result<(), String> {
+    *SESSION_TOKEN.lock().map_err(|_| err("session_state"))? = token;
+    Ok(())
+}
 
 // ── Messages the front end words ────────────────────────────────────────────
 // Anything the user is meant to read travels as `E#code` or `E#code#argument`.
@@ -88,11 +120,26 @@ fn hide_console(mut cmd: Command) -> Command {
 /// Run an ADB command and return its stdout. Maps any failure to a
 /// human-readable `Err(String)`.
 pub(crate) fn adb(adb_path: &std::path::Path, args: &[&str]) -> Result<String, String> {
+    adb_with_input(adb_path, args, None)
+}
+
+/// `input` goes to the child's stdin, which is the only way to get a secret onto
+/// the phone without it appearing in a process argument list anyone can read.
+fn adb_with_input(
+    adb_path: &std::path::Path,
+    args: &[&str],
+    input: Option<&[u8]>,
+) -> Result<String, String> {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
     let mut child = hide_console(Command::new(adb_path))
         .args(args)
+        .stdin(if input.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -112,6 +159,15 @@ pub(crate) fn adb(adb_path: &std::path::Path, args: &[&str]) -> Result<String, S
         let _ = stderr_pipe.read_to_end(&mut buf);
         buf
     });
+
+    if let Some(bytes) = input {
+        let written = child.stdin.take().unwrap().write_all(bytes);
+        if let Err(e) = written {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err_arg("adb_input", e));
+        }
+    }
 
     let timeout_secs = 15;
     let timeout = Duration::from_secs(timeout_secs);
@@ -184,6 +240,23 @@ fn note_stage(wire: usize, plain: usize, connect: f64, send: f64, read: f64, unz
 }
 
 fn daemon_command(cmd: &str) -> Result<String, String> {
+    daemon_command_with_token(cmd, &session_token()?)
+}
+
+/// One command per connection, framed the way the daemon will accept it. A path
+/// carrying a line break would otherwise become a second command, so it is
+/// refused here with a message that says what is wrong with it.
+fn command_payload(cmd: &str, token: &str) -> Result<String, String> {
+    // The bound is the daemon's own: its reader refuses any command line that
+    // reaches 16 KiB, so a payload we are allowed to build must stay under it.
+    if cmd.is_empty() || cmd.len() >= 16 * 1024 || cmd.contains(['\r', '\n', '\0']) {
+        return Err(err("cmd_unsafe"));
+    }
+    Ok(format!("AUTH {token}\n{cmd}\n"))
+}
+
+fn daemon_command_with_token(cmd: &str, token: &str) -> Result<String, String> {
+    let payload = command_payload(cmd, token)?;
     let started = std::time::Instant::now();
     let mut stream = TcpStream::connect_timeout(
         &DAEMON_ADDR.parse().unwrap(),
@@ -195,12 +268,9 @@ fn daemon_command(cmd: &str) -> Result<String, String> {
     stream
         .set_read_timeout(Some(TCP_READ_TIMEOUT))
         .map_err(|e| err_arg("daemon_timeout", e))?;
-
-    let payload = if cmd.ends_with('\n') {
-        cmd.to_string()
-    } else {
-        format!("{cmd}\n")
-    };
+    stream
+        .set_write_timeout(Some(TCP_CONNECT_TIMEOUT))
+        .map_err(|e| err_arg("daemon_timeout", e))?;
     stream
         .write_all(payload.as_bytes())
         .map_err(|e| err_arg("daemon_send", e))?;
@@ -226,7 +296,12 @@ fn daemon_command(cmd: &str) -> Result<String, String> {
     };
     let unzipped = started.elapsed();
 
-    let response = String::from_utf8_lossy(&plain).trim().to_string();
+    // Lossy decoding would silently rewrite any name the phone refuses to
+    // encode — and the rewritten name is what a later delete would be handed.
+    let response = String::from_utf8(plain)
+        .map_err(|_| err("daemon_utf8"))?
+        .trim()
+        .to_string();
     let decoded = started.elapsed();
 
     // A daemon that dies mid-answer can leave *nothing* behind, and an empty
@@ -239,7 +314,7 @@ fn daemon_command(cmd: &str) -> Result<String, String> {
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     note_stage(
         wire,
-        plain.len(),
+        response.len(),
         ms(connected),
         ms(sent - connected),
         ms(read - sent),
@@ -247,6 +322,33 @@ fn daemon_command(cmd: &str) -> Result<String, String> {
         ms(decoded - unzipped),
     );
     Ok(response)
+}
+
+/// The shape every daemon answer is checked against before a caller sees it.
+#[derive(serde::Deserialize)]
+struct DaemonStatus {
+    status: String,
+    message: Option<String>,
+    protocol_version: Option<u32>,
+}
+
+fn require_ok(response: &str) -> Result<DaemonStatus, String> {
+    // Deliberately not the whole scan: the tree is tens of megabytes and nobody
+    // needs a second copy of it just to read one field off the front.
+    let parsed: DaemonStatus =
+        serde_json::from_str(response).map_err(|_| err("daemon_bad_response"))?;
+    if parsed.status != "ok" {
+        return Err(err_arg("daemon_refused", parsed.message.unwrap_or_default()));
+    }
+    Ok(parsed)
+}
+
+/// 32 random bytes as 64 lowercase hex characters — the shape the daemon itself
+/// validates before it will serve a connection.
+fn new_session_token() -> Result<String, String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| err_arg("token_failed", e))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 // ── Tauri Commands ──────────────────────────────────────────────────────────
@@ -261,6 +363,31 @@ fn check_adb(app: tauri::AppHandle) -> Result<String, String> {
 
 #[tauri::command(async)]
 fn init_daemon(app: tauri::AppHandle, serial: Option<String>) -> Result<String, String> {
+    let _operation = DAEMON_OPERATION.lock().map_err(|_| err("daemon_state"))?;
+    set_session_token(None)?;
+    if let Ok(mut root) = SCAN_ROOT.lock() {
+        *root = None;
+    }
+    let result = init_daemon_inner(app.clone(), serial);
+    if result.is_err() {
+        // A half-finished handshake must not leave a live daemon, a stale
+        // forward or a secret file behind on the phone.
+        let has_device = DEVICE_SERIAL.lock().map(|g| g.is_some()).unwrap_or(false);
+        if has_device {
+            if let Ok(adb_path) = get_bundled_binary(&app, "adb") {
+                let _ = adb_s(&adb_path, &["shell", "pkill -f '[s]ocketsweep_daemon' || true"]);
+                let _ = adb_s(&adb_path, &["forward", "--remove", &format!("tcp:{DAEMON_PORT}")]);
+                let _ = adb_s(&adb_path, &["shell", "rm", "-f", DEVICE_TOKEN_PATH]);
+            }
+        }
+        if let Ok(mut guard) = DEVICE_SERIAL.lock() {
+            *guard = None;
+        }
+    }
+    result
+}
+
+fn init_daemon_inner(app: tauri::AppHandle, serial: Option<String>) -> Result<String, String> {
     let adb_path = get_bundled_binary(&app, "adb")?;
     let daemon_src = get_bundled_binary(&app, "daemon")?;
 
@@ -317,6 +444,21 @@ fn init_daemon(app: tauri::AppHandle, serial: Option<String>) -> Result<String, 
     // 2 — Kill any zombie daemon before we push/start.
     let _ = adb_s(&adb_path, &["shell", "pkill -f '[s]ocketsweep_daemon' || true"]);
 
+    // 2.4 — Hand over a fresh secret. It goes in through stdin into a file only
+    // the shell user can read, so it appears in no command line and never in the
+    // JSON the front end is given.
+    let token = new_session_token()?;
+    let _ = adb_s(&adb_path, &["shell", "rm", "-f", DEVICE_TOKEN_PATH]);
+    let token_cmd = format!("umask 077 && cat > {DEVICE_TOKEN_PATH}");
+    let secret = format!("{token}\n");
+    let target = device_serial();
+    let mut args: Vec<&str> = Vec::new();
+    if let Some(ref name) = target {
+        args.extend(["-s", name.as_str()]);
+    }
+    args.extend(["shell", &token_cmd]);
+    adb_with_input(&adb_path, &args, Some(secret.as_bytes()))?;
+
     // 2.5 — Automate MANAGE_EXTERNAL_STORAGE permission for the shell user.
     let _ = adb_s(&adb_path, &["shell", "appops set com.android.shell MANAGE_EXTERNAL_STORAGE allow"]);
 
@@ -330,32 +472,46 @@ fn init_daemon(app: tauri::AppHandle, serial: Option<String>) -> Result<String, 
     let _ = adb_s(&adb_path, &["shell", "pkill", "-f", "'[s]ocketsweep_daemon'"]);
     std::thread::sleep(Duration::from_millis(300));
 
-    // 6 — Start the daemon in the background on the device.
-    let start_cmd = format!("nohup {DEVICE_BIN_PATH} > /dev/null 2>&1 & echo $!; exit");
+    // 6 — Start the daemon in the background on the device. It takes the port
+    // and the secret file, reads and unlinks the latter, and refuses any
+    // connection that does not open with the matching AUTH line.
+    let start_cmd = format!(
+        "nohup {DEVICE_BIN_PATH} {DAEMON_PORT} {DEVICE_TOKEN_PATH} > /dev/null 2>&1 & echo $!; exit"
+    );
     let pid_output = adb_s(&adb_path, &["shell", &start_cmd])?;
     let pid = pid_output.trim().to_string();
 
     // 7 — Set up the USB TCP tunnel.
     adb_s(&adb_path, &["forward", &format!("tcp:{DAEMON_PORT}"), &format!("tcp:{DAEMON_PORT}")])?;
 
-    // 8 — Ping-Retry loop.
+    // 8 — Ping-Retry loop, on the new secret. A daemon too old to answer with
+    // this protocol is treated as a failed start rather than accepted quietly:
+    // it would be an unauthenticated one, still deleting anything asked.
     let mut pong = String::new();
     let mut connected_daemon = false;
+    let mut wrong_daemon = None;
     for _ in 0..15 {
         std::thread::sleep(Duration::from_millis(150));
-        match daemon_command("PING") {
-            Ok(res) => {
-                pong = res;
-                connected_daemon = true;
-                break;
-            }
-            Err(_) => continue,
+        match daemon_command_with_token("PING", &token) {
+            Ok(res) => match require_ok(&res) {
+                Ok(status) if status.protocol_version == Some(DAEMON_PROTOCOL) => {
+                    pong = res;
+                    connected_daemon = true;
+                    break;
+                }
+                Ok(_) => wrong_daemon = Some(err("daemon_outdated")),
+                Err(e) => wrong_daemon = Some(e),
+            },
+            Err(e) => wrong_daemon = Some(e),
         }
     }
 
     if !connected_daemon {
-        return Err(err("daemon_no_ping"));
+        return wrong_daemon.map_or_else(|| Err(err("daemon_no_ping")), Err);
     }
+
+    // Only now does the session exist for everything else to use.
+    set_session_token(Some(token))?;
 
     Ok(format!(
         "{{\"daemon_pid\":\"{pid}\",\"serial\":\"{serial}\",\"ping_response\":{pong}}}"
@@ -375,6 +531,11 @@ fn run_scan(app: tauri::AppHandle, path: Option<String>) -> Result<String, Strin
     // corrupt), and the daemon being alive but blind — it answers instantly with
     // an empty tree when the shell user has lost storage access, which looks
     // exactly like a phone with nothing on it.
+    //
+    // Deliberately NOT holding DAEMON_OPERATION: the recovery below calls
+    // init_daemon, which takes that lock itself, and the standard mutex is not
+    // reentrant. The scan is the long-running command, so serialising it here
+    // would also make a reconnect wait for a scan that is already going wrong.
     let mut attempts = 0;
     let answer = loop {
         attempts += 1;
@@ -456,10 +617,14 @@ fn ping_daemon() -> Result<String, String> {
 
 #[tauri::command(async)]
 fn stop_daemon(app: tauri::AppHandle) -> Result<String, String> {
+    let _operation = DAEMON_OPERATION.lock().map_err(|_| err("daemon_state"))?;
     let adb_path = get_bundled_binary(&app, "adb")?;
-    let response = daemon_command("SHUTDOWN").unwrap_or_else(|_| "daemon already stopped".into());
+    let response = daemon_command("SHUTDOWN")
+        .unwrap_or_else(|_| "{\"status\":\"ok\",\"message\":\"already gone\"}".into());
+    set_session_token(None)?;
     let _ = adb_s(&adb_path, &["forward", "--remove", &format!("tcp:{DAEMON_PORT}")]);
-    let _ = adb_s(&adb_path, &["shell", "rm", DEVICE_BIN_PATH]);
+    let _ = adb_s(&adb_path, &["shell", "rm", "-f", DEVICE_BIN_PATH]);
+    let _ = adb_s(&adb_path, &["shell", "rm", "-f", DEVICE_TOKEN_PATH]);
     Ok(response)
 }
 
@@ -1676,4 +1841,68 @@ pub fn run() {
                 _ => {}
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The daemon's reader treats a line as complete only at '\n', and refuses
+    // '\r', '\0' and anything 16 KiB or longer. A payload that slipped past the
+    // checks here would be rejected on the phone as "Invalid command framing",
+    // which the user cannot act on — so the local refusal has to be the stricter
+    // of the two.
+    #[test]
+    fn payload_opens_with_the_session_secret() {
+        let payload = command_payload("PING", "a").unwrap();
+        assert_eq!(payload, "AUTH a\nPING\n");
+    }
+
+    #[test]
+    fn payload_refuses_lines_that_are_not_one_command() {
+        for cmd in ["", "PING\nSHUTDOWN", "DELETE \r/sdcard/a", "DELETE /sdcard/a\0b"] {
+            assert_eq!(
+                command_payload(cmd, "tok"),
+                Err(err("cmd_unsafe")),
+                "accepted a command that is not a single safe line: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_refuses_what_the_daemon_would_refuse() {
+        let just_under = "x".repeat(16 * 1024 - 1);
+        assert!(command_payload(&just_under, "tok").is_ok());
+        for too_long in ["x".repeat(16 * 1024), "x".repeat(16 * 1024 + 1)] {
+            assert_eq!(command_payload(&too_long, "tok"), Err(err("cmd_unsafe")));
+        }
+    }
+
+    #[test]
+    fn session_secret_is_the_shape_the_daemon_validates() {
+        let token = new_session_token().unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(token.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        assert_ne!(token, new_session_token().unwrap());
+    }
+
+    #[test]
+    fn declared_protocol_matches_the_bundled_daemon() {
+        // engine/daemon.cpp answers PING with this number; if the two drift
+        // apart, every connection fails with "daemon_outdated" on a real phone,
+        // which is exactly the kind of break a text search should not have to
+        // discover by hand. The daemon writes the field inside an escaped C++
+        // string literal, so the digit is found by scanning forward from the
+        // name rather than by matching `"protocol_version":N`.
+        let source = include_str!("../../engine/daemon.cpp");
+        let at = source
+            .find("protocol_version")
+            .expect("the daemon does not answer PING with a protocol_version");
+        let announced = source[at..]
+            .chars()
+            .find(|c| c.is_ascii_digit())
+            .and_then(|c| c.to_digit(10))
+            .expect("no protocol_version number in the daemon source");
+        assert_eq!(u32::try_from(announced).ok(), Some(DAEMON_PROTOCOL));
+    }
 }
