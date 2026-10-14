@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "SocketSweep",
+  "productName": "SocketSweepAtlas",
   "version": "1.3.0",
   "identifier": "com.mathcuber.socketsweep",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "SocketSweep",
+        "title": "SocketSweepAtlas",
         "width": 1024,
         "height": 768
       }

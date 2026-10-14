@@ -376,7 +376,7 @@ function SetupScreen({
 
         <div className="text-center">
           <h1 className="text-2xl font-bold tracking-tight bg-gradient-to-r from-zinc-100 to-zinc-400 bg-clip-text text-transparent">
-            SocketSweep
+            SocketSweep<span className="text-accent-400">Atlas</span>
           </h1>
           <p className="mt-1.5 text-sm text-zinc-500 leading-relaxed">
             {t("connect.tagline")}

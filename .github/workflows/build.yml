@@ -1,4 +1,4 @@
-name: Build SocketSweep
+name: Build SocketSweepAtlas
 
 on:
   push:
@@ -236,13 +236,13 @@ jobs:
           # Prefer the productName-named png (matches Icon= in the desktop
           # file); the bundler may also place one named after the binary
           # (tauri-app.png), which find would otherwise pick first.
-          ICON=$(find "$APPDIR" -maxdepth 1 -name "SocketSweep.png" | head -1)
+          ICON=$(find "$APPDIR" -maxdepth 1 -name "SocketSweepAtlas.png" | head -1)
           if [ -z "$ICON" ]; then
             ICON=$(find "$APPDIR" -maxdepth 1 -name "*.png" | head -1)
           fi
           if [ -z "$ICON" ]; then
-            cp src-tauri/icons/128x128.png "$APPDIR/SocketSweep.png"
-            ICON="$APPDIR/SocketSweep.png"
+            cp src-tauri/icons/128x128.png "$APPDIR/SocketSweepAtlas.png"
+            ICON="$APPDIR/SocketSweepAtlas.png"
           fi
           ICON_NAME=$(basename "$ICON")
           echo "Linking .DirIcon -> $ICON_NAME"
@@ -277,8 +277,8 @@ jobs:
           if [ -e "$APPDIR/AppRun.wrapped" ]; then
             assert_mode 755 "$APPDIR/AppRun.wrapped"
           fi
-          assert_mode 755 "$APPDIR/usr/lib/SocketSweep/bin/adb"
-          assert_mode 755 "$APPDIR/usr/lib/SocketSweep/bin/daemon"
+          assert_mode 755 "$APPDIR/usr/lib/SocketSweepAtlas/bin/adb"
+          assert_mode 755 "$APPDIR/usr/lib/SocketSweepAtlas/bin/daemon"
 
           # Download appimagetool for repacking — pinned to 1.9.1 and
           # checksum-verified (GitHub "continuous" builds are unpinned, and
@@ -293,7 +293,7 @@ jobs:
           # Match the versioned Tauri asset name, and follow published stable
           # releases rather than a fixed tag. Derive the repository so forks
           # do not inadvertently update from the upstream project's releases.
-          UPDATE_INFO="gh-releases-zsync|${GITHUB_REPOSITORY%%/*}|${GITHUB_REPOSITORY#*/}|latest|SocketSweep_*_amd64.AppImage.zsync"
+          UPDATE_INFO="gh-releases-zsync|${GITHUB_REPOSITORY%%/*}|${GITHUB_REPOSITORY#*/}|latest|SocketSweepAtlas_*_amd64.AppImage.zsync"
 
           # Repack in place. appimagetool embeds update information and then
           # generates the sidecar from the FINAL image (including its digest).
@@ -360,14 +360,14 @@ jobs:
         if: matrix.platform == 'macos'
         uses: actions/upload-artifact@v4
         with:
-          name: SocketSweep-macOS
+          name: SocketSweepAtlas-macOS
           path: src-tauri/target/release/bundle/dmg/*.dmg
 
       - name: Upload Linux artifacts
         if: matrix.platform == 'linux'
         uses: actions/upload-artifact@v4
         with:
-          name: SocketSweep-Linux
+          name: SocketSweepAtlas-Linux
           path: |
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/appimage/*.AppImage
@@ -377,7 +377,7 @@ jobs:
         if: matrix.platform == 'windows'
         uses: actions/upload-artifact@v4
         with:
-          name: SocketSweep-Windows
+          name: SocketSweepAtlas-Windows
           path: |
             src-tauri/target/release/bundle/msi/*.msi
             src-tauri/target/release/bundle/nsis/*.exe
@@ -407,6 +407,6 @@ jobs:
           draft: true
           generate_release_notes: false
           files: |
-            artifacts/SocketSweep-Windows/**/*
-            artifacts/SocketSweep-Linux/**/*
-            artifacts/SocketSweep-macOS/**/*
+            artifacts/SocketSweepAtlas-Windows/**/*
+            artifacts/SocketSweepAtlas-Linux/**/*
+            artifacts/SocketSweepAtlas-macOS/**/*

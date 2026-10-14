@@ -329,7 +329,7 @@ export const MESSAGES: Record<string, [zh: string, en: string]> = {
 
   // ── Delete confirmation ───────────────────────────────────────────────────
   "confirm.title": ["确认删除这 {count} 项?", "Delete these {count} {p:item|items}?"],
-  "confirm.note": ["删除后无法在 SocketSweep 里恢复。请核对下面的完整路径,确认没有选错。", "SocketSweep cannot undo a delete. Check the full paths below before confirming."],
+  "confirm.note": ["删除后无法在 SocketSweepAtlas 里恢复。请核对下面的完整路径,确认没有选错。", "SocketSweepAtlas cannot undo a delete. Check the full paths below before confirming."],
   "confirm.filesN": ["{count} 个文件", "{count} {p:file|files}"],
   "confirm.dirsN": ["{count} 个文件夹", "{count} {p:folder|folders}"],
   "confirm.more": ["…还有 {count} 项", "…and {count} {p:item|items} more"],
