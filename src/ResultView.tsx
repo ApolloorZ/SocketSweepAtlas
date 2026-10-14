@@ -7,7 +7,6 @@ import { breadcrumbs, clearStatsCache, collectCategories, findNode, subtreeStats
 import { formatBytes, formatDate, formatNumber, percent } from "./format";
 import { TypeGlyph, TypeIcon } from "./icons";
 import { Thumb } from "./Thumb";
-import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { ApkVersion } from "./ApkVersion";
 import { DownloadsPanel } from "./DownloadsPanel";
 import { useFileOpener } from "./opener";
@@ -591,80 +590,8 @@ export function ResultView({
     };
   };
 
-  /**
-   * Right-click, Explorer style. Popping the menu on a row that is not already
-   * marked replaces the selection with that row — the rule that makes "delete"
-   * mean the thing you just right-clicked rather than whatever was ticked
-   * earlier. Right-clicking empty space keeps the selection and offers the
-   * folder-level verbs instead.
-   */
-  const [menu, setMenu] = useState<{ x: number; y: number; node: FileNode | null } | null>(null);
-
-  const openMenu = (event: React.MouseEvent, node: FileNode | null) => {
-    event.preventDefault();
-    event.stopPropagation();
-    if (node && !selected.has(node.path)) setSelected(new Map([[node.path, node]]));
-    setMenu({ x: event.clientX, y: event.clientY, node });
-  };
-
-  const copyPath = (path: string) => {
-    navigator.clipboard
-      ?.writeText(path)
-      .then(() => notify("ctx.copied", { count: 1 }))
-      .catch(() => notify("ctx.copyFailed"));
-  };
-
-  /** Counted from the live selection, so a menu opened on a marked row says how
-   *  many items the action will really touch. */
-  const menuSubtitle = () =>
-    selected.size > 1 ? t("ctx.appliesTo", { count: formatNumber(selected.size) }) : undefined;
-
-  const menuItems = (node: FileNode | null): MenuItem[] => {
-    const targets = () => [...selected.values()];
-    if (!node) {
-      return [
-        { label: "ctx.rescanAll", onSelect: onRescan },
-        { label: allSelected ? "view.deselectAll" : "view.selectAll", onSelect: toggleSelectAll },
-        ...(view === "browse" ? [{ label: "view.upload", onSelect: () => void pickUpload() }] : []),
-        { label: "ctx.sortBySize", onSelect: () => toggleSort("size") },
-        { label: "ctx.sortByName", onSelect: () => toggleSort("name") },
-        { label: "ctx.sortByTime", onSelect: () => toggleSort("mtime") },
-        { label: "ctx.backHome", onSelect: goHome },
-      ];
-    }
-    const isDir = node.type === "directory";
-    return [
-      ...(isDir
-        ? [{ label: "ctx.openFolder", onSelect: () => openFolder(node.path) }]
-        : [
-            { label: "ctx.open", onSelect: () => void opener.openFile(node) },
-            { label: "ctx.download", onSelect: () => void opener.downloadFiles(targets()) },
-          ]),
-      {
-        label: "ctx.move",
-        onSelect: () => {
-          // Move mode picks its destination by walking, so entering it from a
-          // type view has to take you to the file's own folder first — without
-          // the usual navigation clearing the marked rows.
-          setMoving(true);
-          if (view !== "browse") {
-            setBrowsePath(node.path.slice(0, node.path.lastIndexOf("/")));
-            setView("browse");
-            applyScope(`dir:${node.path.slice(0, node.path.lastIndexOf("/"))}`);
-          }
-        },
-      },
-      { label: "ctx.copyPath", onSelect: () => copyPath(node.path) },
-      // The one entry he asked for that has no backend yet: a per-directory
-      // rescan needs the daemon to answer for one subtree and the tree to be
-      // re-knitted. Listed so the menu is honest about what is coming.
-      ...(isDir ? [{ label: "ctx.rescanFolder", note: "ctx.nextBatch" }] : []),
-      { label: "ctx.properties", note: "ctx.nextBatch" },
-      { label: "ctx.delete", danger: true, onSelect: () => setConfirming(true) },
-    ];
-  };
-
-  const runDelete = async () => {    const paths = [...selected.keys()];
+  const runDelete = async () => {
+    const paths = [...selected.keys()];
     setConfirming(false);
     setSelected(new Map());
     await onDeletePaths(paths);
@@ -850,7 +777,7 @@ export function ResultView({
         </div>
       )}
 
-      <div ref={listRef} onScroll={onListScroll} onContextMenu={(e) => openMenu(e, null)} className={`flex-1 min-h-0 overflow-y-auto ${painting ? "select-none" : ""}`}>
+      <div ref={listRef} onScroll={onListScroll} className={`flex-1 min-h-0 overflow-y-auto ${painting ? "select-none" : ""}`}>
         {view === "home" && (
           <div className="px-5 py-4 flex flex-col gap-4">
             {/* ① Treemap of level-1 folders */}
@@ -962,7 +889,6 @@ export function ResultView({
                   data-path={node.path}
                   onClick={() => (isDir ? openFolder(node.path) : toggleSelected(node))}
                   onDoubleClick={() => !isDir && opener.openFile(node)}
-                  onContextMenu={(e) => openMenu(e, node)}
                   title={t(isDir ? "row.dirHint" : "row.fileHint")}
                   className={`grid items-center gap-3 px-3 py-1.5 rounded-md file-row cursor-pointer ${moving && checked ? "opacity-35" : ""}`}
                   style={{ gridTemplateColumns: grid, ...rowPaint(node, checked) }}
@@ -1172,17 +1098,6 @@ export function ResultView({
           onCancel={opener.cancelTransfer}
           onClear={opener.clearQueue}
           onClose={() => setDownloadsOpen(false)}
-        />
-      )}
-
-      {menu && (
-        <ContextMenu
-          x={menu.x}
-          y={menu.y}
-          title={menu.node ? menu.node.name : t("ctx.folderMenu")}
-          subtitle={menuSubtitle()}
-          items={menuItems(menu.node)}
-          onDismiss={() => setMenu(null)}
         />
       )}
 
