@@ -179,11 +179,11 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
     case "check_adb":
       return wait(400).then(() => "Android Debug Bridge version 1.0.41");
     case "init_daemon":
-      return wait(1600).then(() => JSON.stringify({ daemon_pid: "18442", serial: "982b7b0a", ping_response: { status: "ok" } }));
+      return wait(1600).then(() => JSON.stringify({ daemon_pid: "18442", serial: "SAMPLE0001", ping_response: { status: "ok" } }));
     case "run_scan":
       return wait(2400).then(() => {
-        // `?real=1` loads a scan captured from a real device, served by
-        // `node fixture-server.mjs` (see F:\dev). Used to check perf at scale.
+        // `?real=1` loads a scan captured from a real device, served by a local
+        // fixture server. Used to check perf at scale.
         if (new URLSearchParams(window.location.search).has("real")) {
           return fetch("http://127.0.0.1:5051/real-scan.json").then((r) => r.text());
         }
@@ -238,11 +238,11 @@ export function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise
       // One phone, both transports — what `list_devices` reports once they merge.
       return wait(300).then(() => JSON.stringify([
         {
-          serial: "982b7b0a",
-          model: "M2012K11AC",
+          serial: "SAMPLE0001",
+          model: "SAMPLE Model",
           kind: "usb",
           status: "device",
-          transports: ["982b7b0a", "adb-982b7b0a-VV1VY._adb-tls-connect._tcp"],
+          transports: ["SAMPLE0001", "adb-SAMPLE0001-SAMPLE._adb-tls-connect._tcp"],
         },
       ]));
     case "pair_device":
