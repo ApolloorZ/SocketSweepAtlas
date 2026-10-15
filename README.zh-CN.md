@@ -26,27 +26,27 @@ Redmi K40，25.8 万个文件，146 GB，无线 adb 全盘扫描：
 
 **两种进法，手机都记得。** 数据线，或者扫二维码配对一次——之后点一下就自动连上并开始扫描。
 
-![连接页](assets/fork/01-connect.png)
+![连接页](assets/fork/zh/01-connect.png)
 
 **总览先回答你最关心的那个问题。** 一张一级目录方块图，同一次扫描里顺带把每种类型的数量和体积都统计好，不用再扫一遍才知道视频占多少。
 
-![总览](assets/fork/02-overview.png)
+![总览](assets/fork/zh/02-overview.png)
 
 **然后它就是一个文件管理器。** 每一列表头都能点着排序（体积、占整块盘的比例、名称、修改时间、以及文件所在的目录），当前目录内搜索，全选，按住拖动连选（拖到边缘会自动滚），整行底色直接告诉你这一项占了全盘多少。
 
-![文件列表](assets/fork/03-files-table.png)
+![文件列表](assets/fork/zh/03-files-table.png)
 
 **逐层进入，回来还在原地。** 面包屑、顶层也能用的返回箭头，以及每个目录各自的滚动位置都会记住。
 
-![目录视图](assets/fork/04-folder.png)
+![目录视图](assets/fork/zh/04-folder.png)
 
 **按类型看，安装包还带版本号。** 安装包视图会去读每个 APK 自己的清单，把 `versionName` 显示出来——不安装、不解压、不往手机写任何东西。
 
-![类型视图](assets/fork/05-category.png)
+![类型视图](assets/fork/zh/05-category.png)
 
 **你的电脑你说了算。** 深色/浅色，中文/英文（连手机返回的报错也一起翻译），预览和打开过的文件缓存默认放在软件自己旁边的文件夹里，不去挤 C 盘。
 
-![设置页](assets/fork/07-settings.png)
+![设置页](assets/fork/zh/07-settings.png)
 
 ## 本 fork 改了什么
 

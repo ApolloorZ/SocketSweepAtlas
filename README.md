@@ -26,27 +26,27 @@ Full scan of a Redmi K40, 258,000 files, 146 GB, over wireless adb:
 
 **Two ways in, and the phone remembers both.** Cable, or wireless pairing by QR code — after the first pairing, one click connects and starts scanning.
 
-![Connect screen](assets/fork/01-connect.png)
+![Connect screen](assets/fork/en/01-connect.png)
 
 **The overview answers the first question you have.** One treemap of the top-level folders, and every file type counted in the same pass — no second scan to find out how much your videos weigh.
 
-![Overview](assets/fork/02-overview.png)
+![Overview](assets/fork/en/02-overview.png)
 
 **Then it becomes a file manager.** Sortable columns (size, share of the disk, name, modified date, and the folder a file sits in), search inside the current folder, select-all, drag-to-paint multi-selection that scrolls when you reach the edge, and a whole-row tint that shows how much of the disk each entry takes.
 
-![File list](assets/fork/03-files-table.png)
+![File list](assets/fork/en/03-files-table.png)
 
 **Navigate by folder, and come back where you left off.** Breadcrumbs, a back arrow that behaves at the root, and the scroll position of every folder is remembered while you explore.
 
-![Folder view](assets/fork/04-folder.png)
+![Folder view](assets/fork/en/04-folder.png)
 
 **Type views, including the version an APK declares.** The APK view reads each package's own manifest and shows its `versionName` — no install, no unpacking, nothing written to the phone.
 
-![Type view](assets/fork/05-category.png)
+![Type view](assets/fork/en/05-category.png)
 
 **Your machine, your rules.** Dark or light, Chinese or English (including every error message coming back from the phone), and the preview and opened-file caches live in folders next to the app instead of filling up your C: drive.
 
-![Settings](assets/fork/07-settings.png)
+![Settings](assets/fork/en/07-settings.png)
 
 ## What this fork changed
 
