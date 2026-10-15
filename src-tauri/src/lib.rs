@@ -1185,6 +1185,36 @@ fn ensure_dir(path: std::path::PathBuf, label: &str) -> Result<std::path::PathBu
     Ok(path)
 }
 
+/// A portable copy keeps *everything* in the folder it was unzipped into. The
+/// scratch files already do that (see `default_root`); the settings are the other
+/// half, and they live in two places — the WebView2 profile (localStorage: theme,
+/// language, sort order, the download ledger) and `window.json` — so both have to
+/// move or the copy still leaves state behind on every machine it gets run on.
+///
+/// The marker file is the entire switch: the installer does not ship one, so an
+/// installed copy keeps its state where it has always kept it. The directory is
+/// created by a write probe rather than assumed, so a read-only stick falls back
+/// to the normal locations instead of failing to start.
+fn portable_home(exe_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !exe_dir.join("portable.txt").is_file() {
+        return None;
+    }
+    let dir = exe_dir.join("data");
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => Some(dir),
+        Err(_) => None,
+    }
+}
+
+/// Decided once, before the first window exists: the WebView2 loader reads its
+/// environment when the webview environment is created, and `restore_geometry`
+/// runs during `setup`. `None` means an installed copy.
+static PORTABLE_HOME: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+fn portable_home_set() -> Option<std::path::PathBuf> {
+    PORTABLE_HOME.get().and_then(|value| value.clone())
+}
+
 /// Each of the three gets its own subfolder: "everything in here is ours" has to
 /// stay true for the cache, which is the one that may be emptied on its own.
 fn cache_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
@@ -1758,6 +1788,12 @@ struct Geometry {
 }
 
 fn geometry_file(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    // A portable copy keeps this next to its other state, in the folder the user
+    // unzipped — otherwise "portable" would still leave a file behind in
+    // %APPDATA% on every machine the folder gets copied to.
+    if let Some(home) = portable_home_set() {
+        return Ok(home.join("window.json"));
+    }
     let dir = app.path().app_data_dir().map_err(|e| err_arg("folder_pick", e))?;
     std::fs::create_dir_all(&dir).map_err(|e| err_arg("folder_pick", e))?;
     Ok(dir.join("window.json"))
@@ -1829,6 +1865,21 @@ fn save_geometry(app: &tauri::AppHandle, label: &str) {
 }
 
 pub fn run() {
+    // Before the first window exists: the WebView2 loader reads this once, when it
+    // builds the webview environment, and `restore_geometry` runs during `setup`.
+    let home = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(portable_home))
+        .flatten();
+    #[cfg(windows)]
+    if let Some(dir) = home.as_ref() {
+        let profile = dir.join("webview2");
+        if std::fs::create_dir_all(&profile).is_ok() {
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", profile);
+        }
+    }
+    let _ = PORTABLE_HOME.set(home);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1965,6 +2016,44 @@ mod tests {
             None
         );
         assert_eq!(delete_refusal("not json at all"), None);
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("socketsweep-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_installed_folder_never_moves_the_app_state() {
+        // The installer ships no marker, so an installed copy must keep its state
+        // exactly where it has always kept it; silently relocating it would look
+        // like lost settings to everyone already using the app.
+        let dir = scratch_dir("installed");
+        assert_eq!(portable_home(&dir), None);
+        assert!(!dir.join("data").exists(), "no folder may be created");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_portable_marker_pulls_the_app_state_into_the_folder() {
+        let dir = scratch_dir("portable");
+        std::fs::write(dir.join("portable.txt"), b"portable").unwrap();
+        let home = portable_home(&dir).expect("marker should enable portable mode");
+        assert_eq!(home, dir.join("data"));
+        assert!(home.is_dir(), "the state directory must already exist");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_folder_is_not_portable_because_a_directory_is_named_like_the_marker() {
+        // `is_file`, not `exists`: a stray directory (or an unpacking accident)
+        // must not relocate the state of an installed copy.
+        let dir = scratch_dir("false-marker");
+        std::fs::create_dir(dir.join("portable.txt")).unwrap();
+        assert_eq!(portable_home(&dir), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

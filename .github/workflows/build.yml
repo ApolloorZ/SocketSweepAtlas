@@ -201,6 +201,14 @@ jobs:
       - name: Build Tauri app
         run: npm run tauri build
 
+      # The no-install Windows build is the same compiled exe plus its side-car
+      # files and a marker; nothing about it is toolchain-specific, so this works
+      # on the MSVC runner (which needs no WebView2Loader.dll) as well as locally.
+      - name: Package portable build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\portable-win.ps1
+
       - name: Test Rust bridge
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
 
@@ -381,6 +389,7 @@ jobs:
           path: |
             src-tauri/target/release/bundle/msi/*.msi
             src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/portable/*.zip
 
   # ── Create GitHub Release (only on tag push) ─────────────────────────────
   release:
