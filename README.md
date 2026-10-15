@@ -90,7 +90,7 @@ npm run tauri dev                                 # run against a real phone
 npm run tauri build                               # package
 ```
 
-Three fork-specific notes: `engine/build.sh` and both CI daemon steps link zlib (the helper compresses its own answer); the Windows binaries `adb.exe`, `AdbWinApi.dll`, `AdbWinUsbApi.dll` and `WebView2Loader.dll` are gitignored and must be dropped in by hand; and Windows builds with the GNU toolchain need `--config src-tauri/tauri.windows-gnu.json` plus `crate-type = ["rlib"]` in `src-tauri/Cargo.toml`. On Windows/GNU, `cargo test --lib` and the Python daemon suite cannot execute locally — CI runs them.
+Three fork-specific notes: `engine/build.sh` and both CI daemon steps link zlib (the helper compresses its own answer); the Windows binaries `adb.exe`, `AdbWinApi.dll` and `AdbWinUsbApi.dll` are gitignored — CI downloads platform-tools from Google, a local Windows build has to drop them in by hand; `WebView2Loader.dll` is only needed when you build with the **GNU** toolchain, because `webview2-com-sys` links `WebView2LoaderStatic` on MSVC, and GNU builds add `--config src-tauri/tauri.windows-gnu.json` plus `crate-type = ["rlib"]` in `src-tauri/Cargo.toml`. On Windows/GNU, `cargo test --lib` and the Python daemon suite cannot execute locally — CI runs them.
 
 The tests worth knowing about: `npm test` for byte formatting, `cargo test --lib` for the command framing and the protocol-version agreement between Rust and C++, and `python3 -m unittest discover -s tests` for the daemon itself (auth, scan-root protection, delete races, one-reader-versus-four equivalence — Linux/macOS only).
 
@@ -110,7 +110,7 @@ An installed copy carries more than this repository's source, and each piece kee
 | Component | Licence | Where it ends up |
 |---|---|---|
 | adb (Android platform-tools, Google) | Apache-2.0 | next to the app; used to reach the phone |
-| `WebView2Loader.dll` (Microsoft) | Microsoft WebView2 distribution terms | next to the executable in Windows builds |
+| `WebView2Loader.dll` (Microsoft) | Microsoft WebView2 distribution terms | next to the executable in **GNU** builds only — MSVC links the static loader instead |
 | zlib, **statically linked into the phone helper** | zlib licence (GPL-compatible) | inside `src-tauri/bin/daemon` |
 | Inter, JetBrains Mono | SIL Open Font License 1.1 | embedded in the front end and served from the app rather than a CDN; licence texts are in [`licenses/`](licenses) |
 | Tauri 2, React 19, Recharts | MIT / Apache-2.0 | the desktop shell and the UI |

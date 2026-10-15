@@ -32,7 +32,8 @@ src-tauri/bin/adb.exe
 src-tauri/bin/AdbWinApi.dll
 src-tauri/bin/AdbWinUsbApi.dll
 
-# The GNU toolchain links this dynamically, so a local build has to ship it
+# Only the GNU toolchain links this dynamically — MSVC gets WebView2LoaderStatic
+# from webview2-com-sys, which is why CI's Windows build does not need this file.
 src-tauri/webview2/WebView2Loader.dll
 
 # Exclude local JSON test dumps

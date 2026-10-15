@@ -59,6 +59,7 @@ Redmi K40，25.8 万个文件，146 GB，无线 adb 全盘扫描：
 - **双向传输。** 按钮上传或把文件拖进来，手机内部移动文件，正在传的任务可以取消——取消后电脑和手机两边都不留半截文件。动任何一个字节之前，电脑和手机的剩余空间都会先查一遍。
 - **无线优先。** 扫码配对、局域网发现失灵时的三步兜底，以及"一台手机一行"（同时插线又配对过 Wi-Fi 也只算一台）。
 - **失败看得见，而且多数能自己恢复。** 隧道中途断掉、回答一个字节都没回来、守护进程起来了却扫到 0 个文件——这三种情况都会被识别、报出来，并自动重启手机侧程序重扫一次。跟手机说话的命令全部不在界面线程上跑，每次 adb 调用也不再闪出黑窗口。
+- **删得掉真实安卓结构里的东西，而且拒绝时会说明理由。** 安卓上 `/sdcard/Android/data` 自己就是一个文件系统，所以上游那条"不许跨文件系统"把每一个应用缓存目录都判成不能删——而那正是最值得删的一大片。现在删除会跟着这次扫描走，跨过它真正走过的挂载点，扫描没进去的照样拦住。被拒绝时报的是手机守的那条规则：文件已经不在了、正被占用、在你扫描的目录外面、属于另一个文件系统、是个快捷方式、嵌套太深——而不是一句含糊的"权限不足"。
 - **临时文件放在软件旁边。** 预览与打开过的文件缓存默认落在安装目录下的文件夹，占用可查、可列、可分别清空，下载的东西永远不会被自动清理。
 - **日志面板会打印手机自己报的分段耗时**——遍历、排序、写出、送隧道、压缩后体积——所以一次慢扫描能看出时间到底花在哪。
 
@@ -89,7 +90,7 @@ npm run tauri dev                                 # 连真机跑
 npm run tauri build                               # 打包
 ```
 
-三条本 fork 特有的注意：`engine/build.sh` 和 CI 里两处守护进程编译都要链接 zlib（因为手机侧自己压缩回答）；`adb.exe`、`AdbWinApi.dll`、`AdbWinUsbApi.dll`、`WebView2Loader.dll` 被 gitignore 排除了，Windows 本地构建要手工放进去；用 GNU 工具链在 Windows 上打包必须加 `--config src-tauri/tauri.windows-gnu.json`，并且 `src-tauri/Cargo.toml` 里要保留 `crate-type = ["rlib"]`。在 Windows/GNU 上，`cargo test --lib` 和那套 Python 守护进程测试本机跑不了，由 CI 执行。
+三条本 fork 特有的注意：`engine/build.sh` 和 CI 里两处守护进程编译都要链接 zlib（因为手机侧自己压缩回答）；`adb.exe`、`AdbWinApi.dll`、`AdbWinUsbApi.dll` 被 gitignore 排除了：CI 会从 Google 下载 platform-tools，本地构建则要手工放进去；`WebView2Loader.dll` 只有用 **GNU** 工具链打包时才需要放在可执行文件旁边，因为 `webview2-com-sys` 在 MSVC 上静态链接 `WebView2LoaderStatic`；用 GNU 工具链在 Windows 上打包必须加 `--config src-tauri/tauri.windows-gnu.json`，并且 `src-tauri/Cargo.toml` 里要保留 `crate-type = ["rlib"]`。在 Windows/GNU 上，`cargo test --lib` 和那套 Python 守护进程测试本机跑不了，由 CI 执行。
 
 值得知道的三层测试：`npm test` 管字节数格式化；`cargo test --lib` 管发给手机的命令封包，以及 Rust 与 C++ 两边协议版本号必须一致；`python3 -m unittest discover -s tests` 直接测守护进程（鉴权、扫描根保护、删除竞态、"一个线程 vs 四个线程结果必须相同"）——只能在 Linux/macOS 上跑。
 
@@ -109,7 +110,7 @@ npm run tauri build                               # 打包
 | 组件 | 授权 | 落在哪里 |
 |---|---|---|
 | adb（Android platform-tools，Google） | Apache-2.0 | 与程序同目录，用来连接手机 |
-| `WebView2Loader.dll`（Microsoft） | Microsoft WebView2 分发条款 | Windows 版与可执行文件同目录 |
+| `WebView2Loader.dll`（Microsoft） | Microsoft WebView2 分发条款 | 只出现在 **GNU** 工具链的 Windows 版里，与可执行文件同目录；MSVC 版静态链接的是 loader 的静态库 |
 | zlib，**静态链接进手机侧程序** | zlib 授权（与 GPL 兼容） | 在 `src-tauri/bin/daemon` 里面 |
 | Inter、JetBrains Mono | SIL Open Font License 1.1 | 内嵌在前端、由程序自己提供而不是走 CDN，授权原文在 [`licenses/`](licenses) |
 | Tauri 2、React 19、Recharts | MIT / Apache-2.0 | 桌面外壳与界面 |

@@ -171,7 +171,7 @@ C++17 守护进程，跑在手机上（engine/daemon.cpp）
 
 - `engine/build.sh` 用 `aarch64-linux-android31` 交叉编译，带 `-static-libstdc++ -s`，链接 NDK sysroot 里的 `libz.a`（找不到退回 `-lz`），然后把产物拷到 `src-tauri/bin/daemon`——打包器只认后面那份，忘了拷就等于发布了一个旧守护进程，这种事真的重复发生过。
 - CI 三条腿：Linux（ubuntu-22.04，为了让 glibc 下限低）、macOS、Windows，三层测试全跑，打 tag 时产出草稿 Release。AppImage 那一腿会修 `.DirIcon`、把 `tauri-bundler` 留成 0700 的目录权限改回来，并写入由 `GITHUB_REPOSITORY` 推导的 `gh-releases-zsync` 更新信息——这样分支仓库不会去跟上游的 Release 更新。
-- Windows 只出 NSIS。GNU 构建必须把 `WebView2Loader.dll` 放在可执行文件旁边（它是动态链接的）。打包器会强制每个 Tauri 插件的 npm 包与 crate 次版本号一致——这就是 `@tauri-apps/plugin-opener` 被钉死版本的原因。
+- Windows 只出 NSIS。要不要带 `WebView2Loader.dll` **取决于工具链**，这一点本 fork 内部就搞错过一次：`webview2-com-sys` 0.38.2 在 `target_env = "msvc"` 下选的是 `link(name = "WebView2LoaderStatic", kind = "static")`，只有非 MSVC 分支才 `link(name = "WebView2Loader.dll")`。所以 CI 的 MSVC 构建不需要在可执行文件旁边放任何东西；而我们的 GNU 构建，`objdump -p` 的导入表里确实写着这个 DLL，安装包必须带上它——这就是被 gitignore 排除的 `src-tauri/webview2/WebView2Loader.dll` 和覆盖文件里那一条的由来。教训是：**一份构建产物的导入表，不能拿来当另一套工具链的证据**。打包器还会强制每个 Tauri 插件的 npm 包与 crate 次版本号一致——这就是 `@tauri-apps/plugin-opener` 被钉死版本的原因。
 - 版本号写在 `package.json` 和 `tauri.conf.json`；推 tag 时 CI 会用 tag 覆写这两处。
 
 ## 13. 已知限制，以及有意不做的事
